@@ -109,5 +109,17 @@ temp/
 # Webdev artifacts (checkpoint zips, migrations, etc.)
 .webdev/
 
+# Manus internal metadata
+.manus/
+
+# Manus dev server logs
+.manus-logs/
+
 # Manus version file (auto-generated, not part of source)
 client/public/__manus__/version.json
+
+# Development task tracking (not part of source)
+todo.md
+
+# Uploaded files (processed at runtime, not source)
+uploads/
