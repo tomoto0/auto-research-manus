@@ -6,7 +6,7 @@
 
 Auto Research is a full-stack web application that transforms a research topic into a complete academic paper through a fully autonomous 23-stage pipeline. The system performs literature search across five major academic databases, generates hypotheses, designs and executes experiments with real data analysis, writes the paper body with proper citations, and conducts simulated peer review — all without manual intervention.
 
-**Live Demo:** [https://auto-research.manus.space](https://auto-research.manus.space)
+**Live Demo:** [https://ai-auto-research.manus.space](https://ai-auto-research.manus.space)
 
 ---
 
