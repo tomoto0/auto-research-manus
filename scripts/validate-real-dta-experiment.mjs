@@ -35,6 +35,9 @@ console.log(JSON.stringify({
   metricCount: Object.keys(result.metrics).length,
   charts: result.charts.map((chart) => ({ name: chart.name, url: chart.url, mimeType: chart.mimeType, format: chart.format })),
   tables: result.tables.map((table) => ({ name: table.name, url: table.url, dataBytes: table.data.length })),
+  chunkedProgressLines: result.stdout
+    .split("\n")
+    .filter((line) => /DTA parse\/materialization|Preparing large datasets|Analysis preparation|bounded analysis pass|step-by-step/.test(line)),
   stdoutTail: result.stdout.slice(-2000),
   stderr: result.stderr,
 }, null, 2));

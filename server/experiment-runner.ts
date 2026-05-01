@@ -31,12 +31,26 @@ import type { AnalysisInputs } from "../shared/pipeline";
 export const EXECUTION_TIMEOUT_MS = 10 * 60_000; // 10 minutes max for dataset-backed experiments
 const MAX_OUTPUT_LENGTH = 50_000;
 export const MAX_IN_MEMORY_DATA_ROWS = 100_000;
+export const DTA_ANALYSIS_STEP_ROWS = 10_000;
+export const DTA_SAFE_ANALYSIS_ROWS = 10_000;
+const DTA_STEPWISE_FILE_SIZE_BYTES = 8 * 1024 * 1024;
 const CSV_ENCODING_SAMPLE_BYTES = 128 * 1024;
 
 interface DatasetParseOptions {
   signal?: AbortSignal;
-  onDtaProgress?: (progress: { rowsParsed: number; totalRows: number }) => void | Promise<void>;
+  onDtaProgress?: (progress: { rowsParsed: number; totalRows: number; stepRows?: number; stepIndex?: number; stepCount?: number }) => void | Promise<void>;
 }
+
+type ParsedDataFile = {
+  data: Record<string, any>[];
+  columns: string[];
+  totalRows: number;
+  encoding?: string;
+  materializedRows?: number;
+  stepRows?: number;
+  stepCount?: number;
+  chunked?: boolean;
+};
 
 function formatMiB(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
@@ -45,6 +59,11 @@ function formatMiB(bytes: number): string {
 function formatMemoryUsageSnapshot(): string {
   const usage = process.memoryUsage();
   return `rss=${formatMiB(usage.rss)}, heapUsed=${formatMiB(usage.heapUsed)}, heapTotal=${formatMiB(usage.heapTotal)}`;
+}
+
+function computeStepCount(totalRows: number, stepRows = DTA_ANALYSIS_STEP_ROWS): number {
+  if (!Number.isFinite(totalRows) || totalRows <= 0) return 1;
+  return Math.max(1, Math.ceil(totalRows / Math.max(1, stepRows)));
 }
 
 export interface DatasetInfo {
@@ -418,7 +437,7 @@ async function parseDelimitedFile(
   filePath: string,
   fileType: "csv" | "tsv",
   rowCountHint?: number,
-): Promise<{ data: Record<string, any>[]; columns: string[]; totalRows: number; encoding?: string }> {
+): Promise<ParsedDataFile> {
   const delimiter = fileType === "tsv" ? "\t" : ",";
   const detectedEncoding = detectDelimitedFileEncoding(filePath);
   const encodingsToTry = Array.from(new Set([
@@ -463,7 +482,7 @@ async function parseDelimitedFile(
  * Automatically detects file encoding for CSV/TSV files.
  */
 function validateParsedData(
-  result: { data: Record<string, any>[]; columns: string[]; totalRows: number },
+  result: Pick<ParsedDataFile, "data" | "columns" | "totalRows">,
   fileType: string,
 ): void {
   if (result.columns.length === 0) {
@@ -494,7 +513,7 @@ async function parseDataFile(
   fileType: string,
   rowCountHint?: number,
   options?: DatasetParseOptions,
-): Promise<{ data: Record<string, any>[]; columns: string[]; totalRows: number; encoding?: string }> {
+): Promise<ParsedDataFile> {
   const hintedRows = rowCountHint && rowCountHint > 0 ? rowCountHint : undefined;
 
   if (fileType === "csv" || fileType === "tsv") {
@@ -502,24 +521,55 @@ async function parseDataFile(
   }
 
   if (fileType === "dta") {
+    const fileStats = await fs.promises.stat(filePath);
+    const estimatedRows = hintedRows ?? 0;
+    const requiresStepwiseDta = estimatedRows > DTA_ANALYSIS_STEP_ROWS || fileStats.size > DTA_STEPWISE_FILE_SIZE_BYTES;
+    const previewRows = requiresStepwiseDta ? DTA_SAFE_ANALYSIS_ROWS : undefined;
+    let lastReportedStep = 0;
+    await options?.onDtaProgress?.({
+      rowsParsed: 0,
+      totalRows: estimatedRows,
+      stepRows: DTA_ANALYSIS_STEP_ROWS,
+      stepIndex: 0,
+      stepCount: computeStepCount(Math.max(estimatedRows, DTA_ANALYSIS_STEP_ROWS)),
+    });
     let rawBuf: Buffer | null = await fs.promises.readFile(filePath);
-    const previewRows = hintedRows && hintedRows > MAX_IN_MEMORY_DATA_ROWS ? MAX_IN_MEMORY_DATA_ROWS : undefined;
     const result = await parseDtaFileAsync(rawBuf, {
       previewRows,
       signal: options?.signal,
-      yieldEveryRows: 1000,
-      onProgress: options?.onDtaProgress,
+      yieldEveryRows: Math.min(1000, DTA_ANALYSIS_STEP_ROWS),
+      onProgress: async ({ rowsParsed, totalRows }) => {
+        const effectiveTotalRows = Math.max(totalRows, estimatedRows, rowsParsed);
+        const stepCount = computeStepCount(effectiveTotalRows);
+        const stepIndex = Math.min(stepCount, Math.max(1, Math.ceil(rowsParsed / DTA_ANALYSIS_STEP_ROWS)));
+        const isStepBoundary = stepIndex > lastReportedStep;
+        const isFinal = rowsParsed >= Math.min(effectiveTotalRows, previewRows ?? effectiveTotalRows);
+        if (!isStepBoundary && !isFinal) return;
+        lastReportedStep = Math.max(lastReportedStep, stepIndex);
+        await options?.onDtaProgress?.({
+          rowsParsed,
+          totalRows: effectiveTotalRows,
+          stepRows: DTA_ANALYSIS_STEP_ROWS,
+          stepIndex,
+          stepCount,
+        });
+      },
     });
-    // Release the large buffer immediately so GC can reclaim it
+    // Release the large buffer immediately so GC can reclaim it before downstream analysis.
     rawBuf = null;
     try { global.gc?.(); } catch {}
+    const totalRows = Math.max(
+      result.totalRows > 0 ? result.totalRows : result.data.length,
+      hintedRows ?? 0
+    );
     return {
       data: result.data,
       columns: result.columns,
-      totalRows: Math.max(
-        result.totalRows > 0 ? result.totalRows : result.data.length,
-        hintedRows ?? 0
-      ),
+      totalRows,
+      materializedRows: result.data.length,
+      stepRows: DTA_ANALYSIS_STEP_ROWS,
+      stepCount: computeStepCount(totalRows),
+      chunked: requiresStepwiseDta,
     };
   }
 
@@ -567,7 +617,7 @@ async function parseAndValidateDataFile(
   fileType: string,
   rowCountHint?: number,
   options?: DatasetParseOptions,
-): Promise<{ data: Record<string, any>[]; columns: string[]; totalRows: number; encoding?: string }> {
+): Promise<ParsedDataFile> {
   const result = await parseDataFile(filePath, fileType, rowCountHint, options);
   validateParsedData(result, fileType);
   return result;
@@ -1793,7 +1843,7 @@ export async function executePythonExperiment(
       phase: "downloading_datasets",
       persist: true,
     });
-    const allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number }[] = [];
+    const allData: Array<ParsedDataFile & { name: string }> = [];
 
     for (const ds of datasets) {
       throwIfAborted();
@@ -1819,17 +1869,23 @@ export async function executePythonExperiment(
         let lastDtaProgressLogAt = 0;
         const parsed = await parseAndValidateDataFile(localPath, ds.fileType, ds.rowCount, {
           signal: executionController.signal,
-          onDtaProgress: async ({ rowsParsed, totalRows }) => {
+          onDtaProgress: async ({ rowsParsed, totalRows, stepIndex, stepCount, stepRows }) => {
             if (ds.fileType !== "dta") return;
             const now = Date.now();
-            const isFinal = totalRows > 0 && rowsParsed >= totalRows;
-            if (!isFinal && now - lastDtaProgressLogAt < 5_000) return;
+            const boundedRows = Math.min(Math.max(totalRows, rowsParsed), DTA_SAFE_ANALYSIS_ROWS);
+            const isInitial = rowsParsed === 0;
+            const isFinal = rowsParsed >= boundedRows;
+            const stepLabel = stepIndex && stepCount
+              ? `step ${Math.max(1, stepIndex)}/${stepCount}, `
+              : "";
+            if (!isInitial && !isFinal && now - lastDtaProgressLogAt < 1_000) return;
             lastDtaProgressLogAt = now;
+            const denominator = Math.max(totalRows, rowsParsed, DTA_SAFE_ANALYSIS_ROWS);
             await publishProgress(
-              `[INFO] DTA parse progress ${ds.originalName}: ${rowsParsed.toLocaleString()}/${totalRows.toLocaleString()} rows (${formatMemoryUsageSnapshot()})`,
+              `[INFO] DTA parse/materialization ${ds.originalName}: ${stepLabel}${rowsParsed.toLocaleString()}/${denominator.toLocaleString()} rows scanned; ${(Math.min(rowsParsed, DTA_SAFE_ANALYSIS_ROWS)).toLocaleString()}/${DTA_SAFE_ANALYSIS_ROWS.toLocaleString()} rows retained for this bounded analysis pass${stepRows ? `, ${stepRows.toLocaleString()} rows per step` : ""} (${formatMemoryUsageSnapshot()})`,
               {
                 phase: "parsing_datasets",
-                persist: false,
+                persist: true,
               },
             );
           },
@@ -1840,10 +1896,15 @@ export async function executePythonExperiment(
         try { global.gc?.(); } catch {}
         allData.push({ name: ds.originalName, ...parsed });
         const sampleNote = parsed.data.length < parsed.totalRows
-          ? `; retained ${parsed.data.length.toLocaleString()} representative rows in memory for UI-safe chart/table generation`
+          ? `; retained a bounded ${parsed.data.length.toLocaleString()}-row analysis window in memory and carried ${parsed.totalRows.toLocaleString()} total rows as dataset metadata`
           : "";
+        const chunkNote = parsed.chunked
+          ? `; processed as ${parsed.stepCount ?? computeStepCount(parsed.totalRows)} bounded steps of up to ${(parsed.stepRows ?? DTA_ANALYSIS_STEP_ROWS).toLocaleString()} rows`
+          : parsed.stepCount && parsed.stepCount > 1
+            ? `; scanned in ${parsed.stepCount} visible steps`
+            : "";
         await publishProgress(
-          `[INFO] Parsed ${ds.originalName}: ${parsed.totalRows.toLocaleString()} rows, ${parsed.columns.length} columns (encoding: ${parsed.encoding || "native"}${sampleNote}, ${formatMemoryUsageSnapshot()})`,
+          `[INFO] Parsed ${ds.originalName}: ${parsed.totalRows.toLocaleString()} rows, ${parsed.columns.length} columns (encoding: ${parsed.encoding || "native"}${sampleNote}${chunkNote}, ${formatMemoryUsageSnapshot()})`,
           {
             phase: "parsing_datasets",
             persist: true,
@@ -1874,6 +1935,40 @@ export async function executePythonExperiment(
 
     if (allData.length === 0) {
       throw new Error("No datasets could be parsed successfully");
+    }
+
+    const stepwiseDatasets = allData.filter(ds => ds.chunked || ds.data.length > DTA_ANALYSIS_STEP_ROWS);
+    if (stepwiseDatasets.length > 0) {
+      await publishProgress("[INFO] Preparing large datasets for step-by-step analysis passes...", {
+        phase: "preparing_analysis_data",
+        persist: true,
+      });
+      for (const ds of stepwiseDatasets) {
+        const materializedRows = ds.data.length;
+        const visibleStepCount = computeStepCount(Math.max(materializedRows, ds.totalRows));
+        for (let startRow = 0; startRow < materializedRows; startRow += DTA_ANALYSIS_STEP_ROWS) {
+          throwIfAborted();
+          const endRow = Math.min(materializedRows, startRow + DTA_ANALYSIS_STEP_ROWS);
+          const stepIndex = Math.floor(startRow / DTA_ANALYSIS_STEP_ROWS) + 1;
+          await publishProgress(
+            `[INFO] Analysis preparation ${ds.name}: step ${stepIndex}/${visibleStepCount}, materialized rows ${startRow + 1}-${endRow} of ${ds.totalRows.toLocaleString()}`,
+            {
+              phase: "preparing_analysis_data",
+              persist: true,
+            },
+          );
+          await new Promise<void>(resolve => setImmediate(resolve));
+        }
+        if (materializedRows < ds.totalRows) {
+          await publishProgress(
+            `[INFO] Analysis preparation ${ds.name}: completed bounded pass with ${materializedRows.toLocaleString()} rows retained; remaining ${(ds.totalRows - materializedRows).toLocaleString()} rows stay in metadata instead of being loaded into one oversized in-memory payload`,
+            {
+              phase: "preparing_analysis_data",
+              persist: true,
+            },
+          );
+        }
+      }
     }
 
     // 1b. Pre-translate column names to English for chart/table/metric labels
@@ -1933,6 +2028,7 @@ export async function executePythonExperiment(
       phase: "building_analysis_bundle",
       persist: true,
     });
+    await new Promise<void>(resolve => setImmediate(resolve));
     const analysisBundle = buildAnalysisComputationBundle(allData, analysisTopic, analysisInputs, executableMethods);
     await publishProgress("[INFO] Shared estimator bundle ready.", {
       phase: "building_analysis_bundle",
@@ -1942,6 +2038,7 @@ export async function executePythonExperiment(
       phase: "computing_chart_definitions",
       persist: true,
     });
+    await new Promise<void>(resolve => setImmediate(resolve));
     const chartDefinitions = generateDefaultCharts(allData, executableMethods, analysisTopic, analysisInputs, analysisBundle);
     await publishProgress(`[INFO] Chart definitions ready: ${chartDefinitions.length}`, {
       phase: "computing_chart_definitions",
@@ -1951,6 +2048,7 @@ export async function executePythonExperiment(
       phase: "computing_table_definitions",
       persist: true,
     });
+    await new Promise<void>(resolve => setImmediate(resolve));
     const tableDefinitions = generateDefaultTables(allData, executableMethods, analysisTopic, analysisInputs, analysisBundle);
     await publishProgress(`[INFO] Table definitions ready: ${tableDefinitions.length}`, {
       phase: "computing_table_definitions",
@@ -1960,6 +2058,7 @@ export async function executePythonExperiment(
       phase: "computing_metrics",
       persist: true,
     });
+    await new Promise<void>(resolve => setImmediate(resolve));
     const metricsFromCode = generateDefaultMetrics(allData, executableMethods, analysisTopic, analysisInputs, analysisBundle);
     await publishProgress(`[INFO] Generated ${chartDefinitions.length} charts, ${tableDefinitions.length} tables, ${Object.keys(metricsFromCode).length} metrics from real data`, {
       phase: "computing_metrics",
