@@ -756,6 +756,8 @@ export function parseDtaFile(buf: Buffer, options?: DtaParseOptions): DtaResult 
 }
 
 export async function parseDtaFileAsync(buf: Buffer, options?: DtaAsyncParseOptions): Promise<DtaResult> {
+  const initialAbort = abortError(options?.signal);
+  if (initialAbort) throw initialAbort;
   const err = abortError(options?.signal);
   if (err) throw err;
   const target = resolveDtaParseTarget(buf);

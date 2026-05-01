@@ -3,8 +3,8 @@
  * This handles the case where the server restarts while pipelines are in progress
  */
 import { getDb } from "./db";
-import { pipelineRuns, stageLogs } from "../drizzle/schema";
-import { eq, or } from "drizzle-orm";
+import { pipelineRuns, stageLogs, experimentResults } from "../drizzle/schema";
+import { and, eq, or } from "drizzle-orm";
 
 interface CleanupStaleRunsOptions {
   includePending?: boolean;
@@ -49,7 +49,9 @@ export async function cleanupStaleRuns(options?: CleanupStaleRunsOptions): Promi
         })
         .where(eq(pipelineRuns.runId, run.runId));
 
-      // Mark any running stage logs as failed too
+      // Mark only currently running/pending stage logs as failed. Completed
+      // stages must remain intact so users can see the pipeline progressed past
+      // earlier phases such as dataset parsing before the restart happened.
       await db
         .update(stageLogs)
         .set({
@@ -58,7 +60,28 @@ export async function cleanupStaleRuns(options?: CleanupStaleRunsOptions): Promi
           completedAt: new Date(),
         })
         .where(
-          eq(stageLogs.runId, run.runId)
+          and(
+            eq(stageLogs.runId, run.runId),
+            or(eq(stageLogs.status, "running"), eq(stageLogs.status, "pending")),
+          )
+        );
+
+      // Keep experiment records consistent with the failed run. Without this,
+      // the UI can show an experiment as permanently “running” with logs ending
+      // at dataset parsing, which looks like a DTA parser hang even when the
+      // process was actually interrupted by a server restart.
+      await db
+        .update(experimentResults)
+        .set({
+          executionStatus: "error",
+          stderr: staleReason,
+          exitCode: -1,
+        })
+        .where(
+          and(
+            eq(experimentResults.runId, run.runId),
+            eq(experimentResults.executionStatus, "running"),
+          )
         );
     }
 

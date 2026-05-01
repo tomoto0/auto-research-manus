@@ -28,8 +28,9 @@ import chardet from "chardet";
 import { invokeLLM } from "./_core/llm";
 import type { AnalysisInputs } from "../shared/pipeline";
 
-const EXECUTION_TIMEOUT_MS = 90_000; // 90 seconds max
+export const EXECUTION_TIMEOUT_MS = 10 * 60_000; // 10 minutes max for dataset-backed experiments
 const MAX_OUTPUT_LENGTH = 50_000;
+export const MAX_IN_MEMORY_DATA_ROWS = 100_000;
 const CSV_ENCODING_SAMPLE_BYTES = 128 * 1024;
 
 interface DatasetParseOptions {
@@ -502,7 +503,9 @@ async function parseDataFile(
 
   if (fileType === "dta") {
     let rawBuf: Buffer | null = await fs.promises.readFile(filePath);
+    const previewRows = hintedRows && hintedRows > MAX_IN_MEMORY_DATA_ROWS ? MAX_IN_MEMORY_DATA_ROWS : undefined;
     const result = await parseDtaFileAsync(rawBuf, {
+      previewRows,
       signal: options?.signal,
       yieldEveryRows: 1000,
       onProgress: options?.onDtaProgress,
@@ -1836,8 +1839,11 @@ export async function executePythonExperiment(
         try { fs.unlinkSync(localPath); } catch {}
         try { global.gc?.(); } catch {}
         allData.push({ name: ds.originalName, ...parsed });
+        const sampleNote = parsed.data.length < parsed.totalRows
+          ? `; retained ${parsed.data.length.toLocaleString()} representative rows in memory for UI-safe chart/table generation`
+          : "";
         await publishProgress(
-          `[INFO] Parsed ${ds.originalName}: ${parsed.totalRows} rows, ${parsed.columns.length} columns (encoding: ${parsed.encoding || "native"}, ${formatMemoryUsageSnapshot()})`,
+          `[INFO] Parsed ${ds.originalName}: ${parsed.totalRows.toLocaleString()} rows, ${parsed.columns.length} columns (encoding: ${parsed.encoding || "native"}${sampleNote}, ${formatMemoryUsageSnapshot()})`,
           {
             phase: "parsing_datasets",
             persist: true,

@@ -1,0 +1,36 @@
+import fs from "node:fs";
+import path from "node:path";
+import { describe, expect, it } from "vitest";
+import { parseDtaFileAsync } from "./dta-parser";
+import { EXECUTION_TIMEOUT_MS, MAX_IN_MEMORY_DATA_ROWS } from "./experiment-runner";
+
+const projectRoot = path.resolve(__dirname, "..");
+
+describe("DTA experiment execution regressions", () => {
+  it("uses a dataset-backed execution timeout long enough for DTA parsing, charting, and artifact storage", () => {
+    expect(EXECUTION_TIMEOUT_MS).toBeGreaterThanOrEqual(10 * 60_000);
+  });
+
+  it("caps in-memory dataset rows only for very large files so ordinary DTA datasets remain complete", () => {
+    expect(MAX_IN_MEMORY_DATA_ROWS).toBeGreaterThanOrEqual(100_000);
+  });
+
+  it("aborts DTA parsing immediately when the experiment controller is already cancelled", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("experiment cancelled before parsing"));
+
+    await expect(
+      parseDtaFileAsync(Buffer.from("not a real dta file"), { signal: controller.signal }),
+    ).rejects.toThrow("experiment cancelled before parsing");
+  });
+
+  it("startup cleanup only fails interrupted stage logs and also finalizes stale experiment rows", () => {
+    const cleanupSource = fs.readFileSync(path.join(projectRoot, "server/startup-cleanup.ts"), "utf8");
+
+    expect(cleanupSource).toContain('eq(stageLogs.status, "running")');
+    expect(cleanupSource).toContain('eq(stageLogs.status, "pending")');
+    expect(cleanupSource).toContain("experimentResults");
+    expect(cleanupSource).toContain('eq(experimentResults.executionStatus, "running")');
+    expect(cleanupSource).toContain('executionStatus: "error"');
+  });
+});
