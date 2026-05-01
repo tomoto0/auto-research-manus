@@ -247,4 +247,61 @@ describe("Artifact output regressions", () => {
     expect(controlCountKey ? metrics[controlCountKey] : null).toBe(2);
     expect(bootstrapKey ? Number(metrics[bootstrapKey]) : 0).toBeGreaterThanOrEqual(12);
   });
+
+  it("generates concrete non-OLS causal diagnostics when supported by treatment, time, and covariates", () => {
+    const data = Array.from({ length: 40 }, (_, entityIndex) =>
+      Array.from({ length: 4 }, (_, waveIndex) => {
+        const pidp = entityIndex + 1;
+        const wave = waveIndex + 1;
+        const treatedGroup = entityIndex % 2 === 0 ? 1 : 0;
+        const employmentShock = treatedGroup && wave >= 3 ? 1 : 0;
+        const age = 24 + (entityIndex % 20) + wave * 0.2;
+        const jobHours = 42 - (entityIndex % 6) - wave - employmentShock * 2;
+        const income = 1800 + entityIndex * 12 + wave * 40 - employmentShock * 80;
+        const baselineRisk = (entityIndex % 5) * 0.35;
+        return {
+          pidp,
+          wave,
+          treated_group: treatedGroup,
+          ghq_score: 7 + baselineRisk + wave * 0.25 + employmentShock * 1.6 - jobHours * 0.03 + income * 0.0002,
+          employment_shock: employmentShock,
+          age,
+          job_hours: jobHours,
+          income,
+        };
+      })
+    ).flat();
+    const methods = new Set(["diff_in_diff", "event_study", "propensity_score"]);
+    const analysisInputs = {
+      outcome: "ghq_score",
+      treatment: "employment_shock",
+      entity: "pidp",
+      time: "wave",
+      controls: ["age", "job_hours", "income"],
+    };
+
+    const metrics = generateDefaultMetrics([
+      {
+        name: "causal_panel.csv",
+        totalRows: data.length,
+        columns: ["pidp", "wave", "treated_group", "ghq_score", "employment_shock", "age", "job_hours", "income"],
+        data,
+      },
+    ], methods, "Mental Health and Labour Market in UK", analysisInputs);
+    const charts = generateDefaultCharts([
+      {
+        name: "causal_panel.csv",
+        totalRows: data.length,
+        columns: ["pidp", "wave", "treated_group", "ghq_score", "employment_shock", "age", "job_hours", "income"],
+        data,
+      },
+    ], methods, "Mental Health and Labour Market in UK", analysisInputs);
+
+    expect(Object.keys(metrics).some(key => key.startsWith("did_estimate_"))).toBe(true);
+    expect(Object.keys(metrics).some(key => key.startsWith("event_study_"))).toBe(true);
+    expect(Object.keys(metrics).some(key => key.startsWith("propensity_score_ate_"))).toBe(true);
+    expect(charts.map(chart => chart.name)).toContain("parallel_trends_plot");
+    expect(charts.map(chart => chart.name)).toContain("event_study_plot");
+    expect(charts.map(chart => chart.name)).toContain("propensity_overlap_plot");
+  });
 });

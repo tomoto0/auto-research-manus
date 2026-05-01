@@ -25,6 +25,17 @@ export interface DtaAsyncParseOptions extends DtaParseOptions {
    * block heartbeats or timeout checks. Defaults to 1000.
    */
   yieldEveryRows?: number;
+  /**
+   * When true, scan every row even if previewRows is set, while retaining only
+   * a bounded representative sample in memory. This prevents large files from
+   * silently analysing only the first previewRows observations.
+   */
+  scanAllRows?: boolean;
+  /**
+   * Optional streaming hook invoked for every parsed row before the row is
+   * discarded or retained in the bounded sample.
+   */
+  onRow?: (row: Record<string, any>, rowIndex: number, totalRows: number) => void | Promise<void>;
   onProgress?: (progress: { rowsParsed: number; totalRows: number }) => void | Promise<void>;
   signal?: AbortSignal;
 }
@@ -538,7 +549,8 @@ async function parseOldFormatAsync(
   const prelude = parseOldFormatPrelude(buf);
   let offset = prelude.dataOffset;
   const data: Record<string, any>[] = [];
-  const iterRows = previewMaxRows != null ? Math.min(prelude.nobs, previewMaxRows) : prelude.nobs;
+  const retainMaxRows = previewMaxRows != null ? Math.min(prelude.nobs, previewMaxRows) : prelude.nobs;
+  const iterRows = options?.scanAllRows ? prelude.nobs : retainMaxRows;
 
   for (let i = 0; i < iterRows; i++) {
     await maybeYieldRows(i, prelude.nobs, options);
@@ -578,10 +590,16 @@ async function parseOldFormatAsync(
         offset += 1;
       }
     }
-    data.push(row);
+    await options?.onRow?.(row, i, prelude.nobs);
+    if (data.length < retainMaxRows) {
+      data.push(row);
+    } else if (options?.scanAllRows && retainMaxRows > 0) {
+      const replacementIndex = Math.floor((i * 1103515245 + 12345) % (i + 1));
+      if (replacementIndex < retainMaxRows) data[replacementIndex] = row;
+    }
   }
 
-  await options?.onProgress?.({ rowsParsed: data.length, totalRows: prelude.nobs });
+  await options?.onProgress?.({ rowsParsed: iterRows, totalRows: prelude.nobs });
 
   return {
     data,
@@ -599,7 +617,8 @@ async function parseNewFormatAsync(
   const prelude = parseNewFormatPrelude(buf);
   let offset = prelude.dataOffset;
   const data: Record<string, any>[] = [];
-  const iterRows = previewMaxRows != null ? Math.min(prelude.nobs, previewMaxRows) : prelude.nobs;
+  const retainMaxRows = previewMaxRows != null ? Math.min(prelude.nobs, previewMaxRows) : prelude.nobs;
+  const iterRows = options?.scanAllRows ? prelude.nobs : retainMaxRows;
   const strlRefs: { rowIdx: number; varIdx: number; v: number; o: number }[] = [];
 
   for (let i = 0; i < iterRows; i++) {
@@ -623,7 +642,7 @@ async function parseNewFormatAsync(
           row[prelude.varlist[j]] = "";
         } else {
           row[prelude.varlist[j]] = null;
-          strlRefs.push({ rowIdx: i, varIdx: j, v, o });
+          if (i < retainMaxRows) strlRefs.push({ rowIdx: i, varIdx: j, v, o });
         }
       } else if (typ === 65530) {
         const val = buf.readInt8(offset); offset += 1;
@@ -656,7 +675,13 @@ async function parseNewFormatAsync(
       }
     }
     if (!rowOk) break;
-    data.push(row);
+    await options?.onRow?.(row, i, prelude.nobs);
+    if (data.length < retainMaxRows) {
+      data.push(row);
+    } else if (options?.scanAllRows && retainMaxRows > 0) {
+      const replacementIndex = Math.floor((i * 1103515245 + 12345) % (i + 1));
+      if (replacementIndex < retainMaxRows) data[replacementIndex] = row;
+    }
   }
 
   const remainingBytes = buf.length - offset;
@@ -730,7 +755,7 @@ async function parseNewFormatAsync(
     }
   }
 
-  await options?.onProgress?.({ rowsParsed: data.length, totalRows: prelude.nobs });
+  await options?.onProgress?.({ rowsParsed: iterRows, totalRows: prelude.nobs });
 
   return {
     data,

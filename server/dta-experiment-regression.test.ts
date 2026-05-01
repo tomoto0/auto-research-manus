@@ -23,7 +23,8 @@ describe("DTA experiment execution regressions", () => {
     expect(runnerSource).toContain("DTA parse/materialization");
     expect(runnerSource).toContain("rows retained for this bounded analysis pass");
     expect(runnerSource).toContain("preparing_analysis_data");
-    expect(runnerSource).toContain("remaining ${(ds.totalRows - materializedRows).toLocaleString()} rows stay in metadata");
+    expect(runnerSource).toContain("all ${ds.totalRows.toLocaleString()} rows contributed to the streaming profile");
+    expect(runnerSource).toContain("streaming statistics across");
   });
 
   it("aborts DTA parsing immediately when the experiment controller is already cancelled", async () => {

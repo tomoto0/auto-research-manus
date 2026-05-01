@@ -41,6 +41,20 @@ interface DatasetParseOptions {
   onDtaProgress?: (progress: { rowsParsed: number; totalRows: number; stepRows?: number; stepIndex?: number; stepCount?: number }) => void | Promise<void>;
 }
 
+type StreamingNumericSummary = {
+  n: number;
+  sum: number;
+  sumSq: number;
+  min: number;
+  max: number;
+};
+
+type FullDataProfile = {
+  scannedRows: number;
+  numeric: Record<string, StreamingNumericSummary>;
+  categorical: Record<string, Record<string, number>>;
+};
+
 type ParsedDataFile = {
   data: Record<string, any>[];
   columns: string[];
@@ -50,6 +64,7 @@ type ParsedDataFile = {
   stepRows?: number;
   stepCount?: number;
   chunked?: boolean;
+  fullDataProfile?: FullDataProfile;
 };
 
 function formatMiB(bytes: number): string {
@@ -64,6 +79,45 @@ function formatMemoryUsageSnapshot(): string {
 function computeStepCount(totalRows: number, stepRows = DTA_ANALYSIS_STEP_ROWS): number {
   if (!Number.isFinite(totalRows) || totalRows <= 0) return 1;
   return Math.max(1, Math.ceil(totalRows / Math.max(1, stepRows)));
+}
+
+function createFullDataProfile(): FullDataProfile {
+  return { scannedRows: 0, numeric: {}, categorical: {} };
+}
+
+function updateFullDataProfile(profile: FullDataProfile, row: Record<string, any>): void {
+  profile.scannedRows += 1;
+  for (const [column, raw] of Object.entries(row)) {
+    if (raw === null || raw === undefined || raw === "") continue;
+    const value = Number(raw);
+    if (Number.isFinite(value)) {
+      const summary = profile.numeric[column] || { n: 0, sum: 0, sumSq: 0, min: value, max: value };
+      summary.n += 1;
+      summary.sum += value;
+      summary.sumSq += value * value;
+      summary.min = Math.min(summary.min, value);
+      summary.max = Math.max(summary.max, value);
+      profile.numeric[column] = summary;
+      continue;
+    }
+    const text = String(raw).trim();
+    if (!text) continue;
+    const counts = profile.categorical[column] || {};
+    if (Object.keys(counts).length < 200 || counts[text] !== undefined) {
+      counts[text] = (counts[text] || 0) + 1;
+      profile.categorical[column] = counts;
+    }
+  }
+}
+
+function streamingMean(summary: StreamingNumericSummary): number {
+  return summary.n > 0 ? summary.sum / summary.n : 0;
+}
+
+function streamingStdDev(summary: StreamingNumericSummary): number {
+  if (summary.n <= 1) return 0;
+  const variance = (summary.sumSq - (summary.sum * summary.sum) / summary.n) / Math.max(1, summary.n - 1);
+  return Math.sqrt(Math.max(0, variance));
 }
 
 export interface DatasetInfo {
@@ -206,6 +260,17 @@ function buildMethodSetFromList(methods?: string[] | null): Set<string> | null {
   for (const methodId of methods) {
     const normalized = normaliseMethodId(methodId);
     if (normalized) set.add(normalized);
+  }
+  const conventionalOnly = ["descriptive_statistics", "correlation", "group_comparison", "time_trend", "robust_ols", "linear_regression"];
+  const causalMethods = ["panel_fixed_effects", "diff_in_diff", "event_study", "propensity_score", "iv_2sls", "regression_discontinuity", "synthetic_control"];
+  const hasConventional = conventionalOnly.some(method => set.has(method));
+  const hasCausal = causalMethods.some(method => set.has(method));
+  if (hasConventional && !hasCausal) {
+    // Evaluate feasible causal estimators as well. Infeasible estimators naturally return no output,
+    // but this avoids stopping at a shallow descriptive/correlation-only report.
+    for (const method of ["panel_fixed_effects", "diff_in_diff", "event_study", "propensity_score", "data_visualisation"]) {
+      set.add(method);
+    }
   }
   return set;
 }
@@ -525,6 +590,7 @@ async function parseDataFile(
     const estimatedRows = hintedRows ?? 0;
     const requiresStepwiseDta = estimatedRows > DTA_ANALYSIS_STEP_ROWS || fileStats.size > DTA_STEPWISE_FILE_SIZE_BYTES;
     const previewRows = requiresStepwiseDta ? DTA_SAFE_ANALYSIS_ROWS : undefined;
+    const scanAllRows = requiresStepwiseDta;
     let lastReportedStep = 0;
     await options?.onDtaProgress?.({
       rowsParsed: 0,
@@ -533,17 +599,20 @@ async function parseDataFile(
       stepIndex: 0,
       stepCount: computeStepCount(Math.max(estimatedRows, DTA_ANALYSIS_STEP_ROWS)),
     });
+    const fullDataProfile = createFullDataProfile();
     let rawBuf: Buffer | null = await fs.promises.readFile(filePath);
     const result = await parseDtaFileAsync(rawBuf, {
       previewRows,
+      scanAllRows,
       signal: options?.signal,
       yieldEveryRows: Math.min(1000, DTA_ANALYSIS_STEP_ROWS),
+      onRow: (row) => updateFullDataProfile(fullDataProfile, row),
       onProgress: async ({ rowsParsed, totalRows }) => {
         const effectiveTotalRows = Math.max(totalRows, estimatedRows, rowsParsed);
         const stepCount = computeStepCount(effectiveTotalRows);
         const stepIndex = Math.min(stepCount, Math.max(1, Math.ceil(rowsParsed / DTA_ANALYSIS_STEP_ROWS)));
         const isStepBoundary = stepIndex > lastReportedStep;
-        const isFinal = rowsParsed >= Math.min(effectiveTotalRows, previewRows ?? effectiveTotalRows);
+        const isFinal = rowsParsed >= effectiveTotalRows;
         if (!isStepBoundary && !isFinal) return;
         lastReportedStep = Math.max(lastReportedStep, stepIndex);
         await options?.onDtaProgress?.({
@@ -570,6 +639,7 @@ async function parseDataFile(
       stepRows: DTA_ANALYSIS_STEP_ROWS,
       stepCount: computeStepCount(totalRows),
       chunked: requiresStepwiseDta,
+      fullDataProfile,
     };
   }
 
@@ -841,8 +911,8 @@ export function generateSvgFallbackChart(
   let title = Array.isArray(rawTitle)
     ? String(rawTitle.join(" "))
     : String(rawTitle || config.type || "Chart");
-  // Strip non-ASCII from title for safe SVG rendering
-  title = title.replace(/[^\x20-\x7E]/g, "").trim() || "Chart";
+  // Keep chart titles readable in rasterized SVG by translating/transliterating non-ASCII text instead of dropping it.
+  title = ensureAsciiLabelSync(title, "Chart").trim() || "Chart";
   const chartType = String(config.type || "bar").toLowerCase();
   const datasets: any[] = Array.isArray(config.data?.datasets) ? config.data.datasets : [];
   const labels: string[] = Array.isArray(config.data?.labels)
@@ -863,10 +933,7 @@ export function generateSvgFallbackChart(
     return [min, max];
   };
   const shortLabel = (value: unknown, maxLen = 30): string => {
-    let text = String(value ?? "");
-    // Strip non-ASCII characters as a safety net (labels should already be transliterated)
-    text = text.replace(/[^\x20-\x7E]/g, "").trim();
-    if (!text) text = "N/A";
+    const text = ensureAsciiLabelSync(String(value ?? ""), "Label").replace(/\s+/g, " ").trim() || "N/A";
     return text.length > maxLen ? `${text.slice(0, maxLen - 3)}...` : text;
   };
   const readRecord = (value: unknown): Record<string, unknown> =>
@@ -883,7 +950,14 @@ export function generateSvgFallbackChart(
   // The unquoted generic keyword 'sans-serif' always has a system fallback in librsvg.
   const fontFamily = `sans-serif`;
 
-  const padding = { top: 56, right: 36, bottom: 84, left: 64 };
+  const estimatedLegendCount = Math.min(datasets.length, 6);
+  const estimatedLegendRows = estimatedLegendCount > 0
+    ? Math.ceil(estimatedLegendCount / (Math.max(...datasets.slice(0, estimatedLegendCount).map((item, i) => String(item?.label || `Dataset ${i + 1}`).length)) > 22 ? Math.min(2, estimatedLegendCount) : Math.min(3, estimatedLegendCount)))
+    : 0;
+  const bottomPadding = chartType !== "pie" && chartType !== "doughnut" && chartType !== "heatmap" && estimatedLegendRows > 0
+    ? Math.max(104, 84 + estimatedLegendRows * 24)
+    : 84;
+  const padding = { top: 56, right: 36, bottom: bottomPadding, left: 64 };
   const plotX = padding.left;
   const plotY = padding.top;
   const plotWidth = Math.max(160, width - padding.left - padding.right);
@@ -1391,22 +1465,28 @@ export function generateSvgFallbackChart(
     }
   }
 
-  // Shared legend for non-pie charts
-  if (chartType !== "pie" && chartType !== "doughnut" && chartType !== "heatmap" && datasets.length > 0) {
+  // Shared legend for non-pie charts. Long variable names are common in survey and panel data,
+  // so the legend layout adapts instead of squeezing every series into three fixed columns.
+  const shouldDrawSharedLegend = config.options?.plugins?.legend?.display !== false;
+  if (shouldDrawSharedLegend && chartType !== "pie" && chartType !== "doughnut" && chartType !== "heatmap" && datasets.length > 0) {
     const legendCount = Math.min(datasets.length, 6);
-    const legendColumns = Math.min(3, legendCount);
+    const legendRawLabels = datasets.slice(0, legendCount).map((item, i) => String(item?.label || `Dataset ${i + 1}`));
+    const longestLegendLabel = Math.max(...legendRawLabels.map(label => label.length));
+    const legendColumns = longestLegendLabel > 22 ? Math.min(2, legendCount) : Math.min(3, legendCount);
     const legendRows = Math.ceil(legendCount / legendColumns);
-    const legendStartY = height - 18 - (legendRows - 1) * 14;
+    const legendLineHeight = 15;
+    const legendStartY = height - 18 - (legendRows - 1) * legendLineHeight;
     const legendCellW = plotWidth / legendColumns;
+    const legendMaxChars = Math.max(12, Math.min(30, Math.floor((legendCellW - 18) / 5.6)));
     for (let i = 0; i < legendCount; i++) {
       const row = Math.floor(i / legendColumns);
       const col = i % legendColumns;
       const x = plotX + col * legendCellW;
-      const y = legendStartY + row * 14;
+      const y = legendStartY + row * legendLineHeight;
       const color = pickColor(i, datasets[i]?.backgroundColor || datasets[i]?.borderColor);
-      const label = shortLabel(datasets[i]?.label || `Dataset ${i + 1}`, 28);
+      const label = shortLabel(legendRawLabels[i], legendMaxChars);
       parts.push(`<rect x="${x}" y="${y - 8}" width="9" height="9" fill="${color}"/>`);
-      parts.push(`<text x="${x + 13}" y="${y}" font-size="9" fill="#666">${escapeXml(label)}</text>`);
+      parts.push(`<text x="${x + 13}" y="${y}" font-size="8.5" fill="#666">${escapeXml(label)}</text>`);
     }
   }
 
@@ -1675,9 +1755,17 @@ async function transliterateChartConfigAsync(config: any): Promise<any> {
 }
 
 function escapeXml(str: string): string {
-  // Strip non-ASCII characters that would render as garbled text in SVG→PNG conversion
-  const ascii = str.replace(/[^\x20-\x7E]/g, "").trim();
-  return ascii.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const readable = ensureAsciiLabelSync(String(str ?? ""), "Label").trim();
+  return readable.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function csvCell(value: string | number): string {
+  const raw = String(value ?? "");
+  const normalized = /[^\x00-\x7F]/.test(raw) ? ensureAsciiLabelSync(raw, "Value") : raw;
+  if (/[",\n\r]/.test(normalized)) {
+    return `"${normalized.replace(/"/g, '""')}"`;
+  }
+  return normalized;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1872,15 +1960,14 @@ export async function executePythonExperiment(
           onDtaProgress: async ({ rowsParsed, totalRows, stepIndex, stepCount, stepRows }) => {
             if (ds.fileType !== "dta") return;
             const now = Date.now();
-            const boundedRows = Math.min(Math.max(totalRows, rowsParsed), DTA_SAFE_ANALYSIS_ROWS);
+            const denominator = Math.max(totalRows, rowsParsed, DTA_SAFE_ANALYSIS_ROWS);
             const isInitial = rowsParsed === 0;
-            const isFinal = rowsParsed >= boundedRows;
+            const isFinal = rowsParsed >= denominator;
             const stepLabel = stepIndex && stepCount
               ? `step ${Math.max(1, stepIndex)}/${stepCount}, `
               : "";
             if (!isInitial && !isFinal && now - lastDtaProgressLogAt < 1_000) return;
             lastDtaProgressLogAt = now;
-            const denominator = Math.max(totalRows, rowsParsed, DTA_SAFE_ANALYSIS_ROWS);
             await publishProgress(
               `[INFO] DTA parse/materialization ${ds.originalName}: ${stepLabel}${rowsParsed.toLocaleString()}/${denominator.toLocaleString()} rows scanned; ${(Math.min(rowsParsed, DTA_SAFE_ANALYSIS_ROWS)).toLocaleString()}/${DTA_SAFE_ANALYSIS_ROWS.toLocaleString()} rows retained for this bounded analysis pass${stepRows ? `, ${stepRows.toLocaleString()} rows per step` : ""} (${formatMemoryUsageSnapshot()})`,
               {
@@ -1896,7 +1983,7 @@ export async function executePythonExperiment(
         try { global.gc?.(); } catch {}
         allData.push({ name: ds.originalName, ...parsed });
         const sampleNote = parsed.data.length < parsed.totalRows
-          ? `; retained a bounded ${parsed.data.length.toLocaleString()}-row analysis window in memory and carried ${parsed.totalRows.toLocaleString()} total rows as dataset metadata`
+          ? `; retained a bounded ${parsed.data.length.toLocaleString()}-row representative sample in memory and accumulated streaming statistics across ${parsed.fullDataProfile?.scannedRows?.toLocaleString?.() || parsed.totalRows.toLocaleString()} rows`
           : "";
         const chunkNote = parsed.chunked
           ? `; processed as ${parsed.stepCount ?? computeStepCount(parsed.totalRows)} bounded steps of up to ${(parsed.stepRows ?? DTA_ANALYSIS_STEP_ROWS).toLocaleString()} rows`
@@ -1946,12 +2033,12 @@ export async function executePythonExperiment(
       for (const ds of stepwiseDatasets) {
         const materializedRows = ds.data.length;
         const visibleStepCount = computeStepCount(Math.max(materializedRows, ds.totalRows));
-        for (let startRow = 0; startRow < materializedRows; startRow += DTA_ANALYSIS_STEP_ROWS) {
+        for (let startRow = 0; startRow < Math.max(materializedRows, ds.totalRows); startRow += DTA_ANALYSIS_STEP_ROWS) {
           throwIfAborted();
-          const endRow = Math.min(materializedRows, startRow + DTA_ANALYSIS_STEP_ROWS);
+          const endRow = Math.min(ds.totalRows, startRow + DTA_ANALYSIS_STEP_ROWS);
           const stepIndex = Math.floor(startRow / DTA_ANALYSIS_STEP_ROWS) + 1;
           await publishProgress(
-            `[INFO] Analysis preparation ${ds.name}: step ${stepIndex}/${visibleStepCount}, materialized rows ${startRow + 1}-${endRow} of ${ds.totalRows.toLocaleString()}`,
+            `[INFO] Analysis preparation ${ds.name}: step ${stepIndex}/${visibleStepCount}, source rows ${startRow + 1}-${endRow} of ${ds.totalRows.toLocaleString()} summarized via streaming profile; ${materializedRows.toLocaleString()} representative rows retained for model diagnostics`,
             {
               phase: "preparing_analysis_data",
               persist: true,
@@ -1961,7 +2048,7 @@ export async function executePythonExperiment(
         }
         if (materializedRows < ds.totalRows) {
           await publishProgress(
-            `[INFO] Analysis preparation ${ds.name}: completed bounded pass with ${materializedRows.toLocaleString()} rows retained; remaining ${(ds.totalRows - materializedRows).toLocaleString()} rows stay in metadata instead of being loaded into one oversized in-memory payload`,
+            `[INFO] Analysis preparation ${ds.name}: completed bounded pass with ${materializedRows.toLocaleString()} representative rows retained for diagnostics; all ${ds.totalRows.toLocaleString()} rows contributed to the streaming profile, including ${(ds.totalRows - materializedRows).toLocaleString()} rows summarized without loading one oversized in-memory payload`,
             {
               phase: "preparing_analysis_data",
               persist: true,
@@ -2269,12 +2356,12 @@ export async function executePythonExperiment(
           phase: "processing_tables",
           persist: true,
         });
-        const headerRow = tableDef.headers.join(",");
-        const dataRows = tableDef.rows.map((r: (string | number)[]) => r.join(",")).join("\n");
-        const csvContent = `${headerRow}\n${dataRows}`;
+        const headerRow = tableDef.headers.map(h => csvCell(h)).join(",");
+        const dataRows = tableDef.rows.map((r: (string | number)[]) => r.map(cell => csvCell(cell)).join(",")).join("\n");
+        const csvContent = `\ufeff${headerRow}\n${dataRows}`;
 
         const tableKey = `experiments/${runId}/${tableDef.name}.csv`;
-        const { url } = await storagePut(tableKey, csvContent, "text/csv");
+        const { url } = await storagePut(tableKey, csvContent, "text/csv; charset=utf-8");
         tables.push({
           name: tableDef.name,
           url,
@@ -2414,6 +2501,34 @@ function isMissingValue(value: unknown): boolean {
   return value === null || value === undefined || value === "" || value === "NA" || value === "NaN" || value === ".";
 }
 
+function isLowCardinalityNumericCategory(col: string, data: Record<string, any>[]): boolean {
+  const lowerCol = col.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const categoryNamePatterns = [
+    "sex", "gender", "male", "female", "group", "arm", "cohort", "category", "type", "class",
+    "race", "ethnicity", "marital", "education", "treated", "treatment", "control", "post", "eligible",
+    "binary", "dummy", "indicator", "status", "employment", "region", "wave", "panel",
+  ];
+  const continuousNamePatterns = [
+    "score", "rating", "scale", "age", "year", "income", "salary", "wage", "price", "cost",
+    "amount", "count", "rate", "ratio", "percent", "duration", "hours", "weight", "height",
+  ];
+  const nameLooksCategorical = categoryNamePatterns.some(pattern => lowerCol.includes(pattern));
+  const nameLooksContinuous = continuousNamePatterns.some(pattern => lowerCol.includes(pattern));
+  const values = data.slice(0, Math.min(data.length, 500))
+    .map(row => Number(row[col]))
+    .filter(value => Number.isFinite(value));
+  if (values.length < 20) return false;
+  const uniqueValues = Array.from(new Set(values));
+  const allInteger = uniqueValues.every(value => Number.isInteger(value));
+  if (!allInteger) return false;
+  const uniqueCount = uniqueValues.length;
+  const uniqueShare = uniqueCount / values.length;
+  if (uniqueCount <= 2) return true;
+  if (nameLooksCategorical && uniqueCount <= 20 && uniqueShare <= 0.35) return true;
+  if (!nameLooksContinuous && uniqueCount <= 10 && uniqueShare <= 0.15) return true;
+  return false;
+}
+
 export function classifyColumns(
   data: Record<string, any>[],
   columns: string[]
@@ -2449,6 +2564,9 @@ export function classifyColumns(
         idCols.push(col);
       } else {
         numericCols.push(col);
+        if (isLowCardinalityNumericCategory(col, data)) {
+          categoricalCols.push(col);
+        }
       }
     } else {
       categoricalCols.push(col);
@@ -2467,6 +2585,7 @@ type ParsedDataset = {
   data: Record<string, any>[];
   columns: string[];
   totalRows: number;
+  fullDataProfile?: FullDataProfile;
 };
 
 function metricKeyPart(input: string, maxLen = 24): string {
@@ -3071,10 +3190,14 @@ function detectEntityColumns(ds: ParsedDataset, categoricalCols: string[], idCol
 function detectTreatmentColumns(ds: ParsedDataset, numericCols: string[], categoricalCols: string[]): string[] {
   const scored = new Map<string, number>();
   for (const col of [...numericCols, ...categoricalCols, ...ds.columns]) {
+    const normalized = col.toLowerCase();
     let score = 0;
-    if (/(treat|treatment|intervention|policy|program|exposure|assignment|eligible)/i.test(col)) score += 5;
-    if (/(post|after)/i.test(col)) score += 1;
+    if (/(treat|treatment|intervention|policy|program|exposure|assignment|eligible|eligibility|shock|reform|law|mandate|subsidy|grant|random|lottery)/i.test(normalized)) score += 6;
+    if (/(post|after|treated|did|difference)/i.test(normalized)) score += 2;
     if (isBinaryLikeColumn(ds, col)) score += 3;
+    // Variables that look like outcomes should not become treatments merely because they are binary.
+    if (/(outcome|target|response|score|rate|risk|income|wage|earnings|salary|price|cost|value|performance|sales|mortality|health|mental|depress|anxiety|stress|wellbeing|happiness|satisfaction|employment|unemployment|hours|productivity|ghq|phq|gad|k6|k10|cesd|who5|sf12|sf36)/i.test(normalized)) score -= 5;
+    if (/(id|code|index|year|month|wave|date|time)/i.test(normalized)) score -= 3;
     if (score > 0) scored.set(col, Math.max(score, scored.get(col) || 0));
   }
   return Array.from(scored.entries())
@@ -3120,6 +3243,7 @@ function detectOutcomeColumns(ds: ParsedDataset, numericCols: string[], topic?: 
   for (const col of numericCols) {
     let score = 1;
     if (/(outcome|target|response|score|rate|risk|income|wage|price|cost|value|metric|performance|sales|earnings|mortality|health|mental|depress|anxiety|stress|wellbeing|happiness|satisfaction|employment|unemployment|hours|productivity|ghq|phq|gad|k6|k10|cesd|who5|sf12|sf36)/i.test(col)) score += 5;
+    if (/(treat|treatment|intervention|policy|program|exposure|assignment|eligible|eligibility|shock|reform|law|mandate|subsidy|grant|random|lottery|post|after|treated|did)/i.test(col)) score -= 6;
     score += scoreTopicAlignment(col, topicKeywords);
     if (/(id|code|index)$/i.test(col)) score -= 2;
     if (/(^age$|_age$|^year$|^month$|^wave$|post|after|dummy|flag|indicator|treated?|control)/i.test(col)) score -= 2;
@@ -3154,15 +3278,15 @@ function inferEconometricDesignHints(
   const outcomeCols = detectOutcomeColumns(ds, numericCols, topic);
   const instrumentCols = detectInstrumentColumns(ds);
   const runningCols = detectRunningVariableColumns(ds, numericCols);
-  const primaryOutcomeCol = outcomeCols[0] || numericCols[0];
   const primaryInstrumentCol = instrumentCols[0];
+  const primaryOutcomeCol = outcomeCols.find(col => !treatmentCols.includes(col) && col !== primaryInstrumentCol) || outcomeCols[0] || numericCols[0];
   const primaryTreatmentCol =
     treatmentCols.find(col => col !== primaryOutcomeCol && col !== primaryInstrumentCol) ||
     treatmentCols.find(col => col !== primaryOutcomeCol) ||
     treatmentCols[0];
   const primaryRegressorCol =
     (primaryTreatmentCol && primaryTreatmentCol !== primaryOutcomeCol ? primaryTreatmentCol : undefined) ||
-    numericCols.find(col => col !== primaryOutcomeCol);
+    numericCols.find(col => col !== primaryOutcomeCol && !outcomeCols.includes(col));
 
   return mergeAnalysisInputsIntoDesignHints(ds, {
     timeCols,
@@ -5466,7 +5590,7 @@ function getPrimaryDataset(allData: ParsedDataset[]): ParsedDataset | null {
 }
 
 export function generateDefaultCharts(
-  allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number }[],
+  allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number; fullDataProfile?: FullDataProfile }[],
   executableMethods: Set<string> | null,
   analysisTopic = "",
   analysisInputs?: AnalysisInputs,
@@ -5941,7 +6065,14 @@ export function generateDefaultCharts(
             }),
           },
           options: {
-            plugins: { title: { display: true, text: `Comparison by ${displayCatCol}`, font: { size: 16 } } },
+            plugins: {
+              title: {
+                display: true,
+                text: `Comparison by ${displayCatCol} (${useCols.map(c => c.length > 12 ? c.slice(0, 9) + "..." : c).join(", ")})`,
+                font: { size: 16 },
+              },
+              legend: { display: false },
+            },
             scales: { y: { title: { display: true, text: "Mean value" } }, x: { title: { display: true, text: displayCatCol } } },
           },
         },
@@ -6852,7 +6983,7 @@ function buildRoutingDiagnostics(
 }
 
 function generateDefaultTables(
-  allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number }[],
+  allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number; fullDataProfile?: FullDataProfile }[],
   executableMethods: Set<string> | null,
   analysisTopic = "",
   analysisInputs?: AnalysisInputs,
@@ -6867,6 +6998,7 @@ function generateDefaultTables(
   const categoricalCols = bundle?.categoricalCols || [];
   const primaryDescriptiveCol = bundle?.primaryDescriptiveCol;
   const methodAssessments = bundle?.methodAssessments || [];
+  const designHints = bundle?.designHints || null;
   const robustOls = bundle?.robustOls || null;
   const panelFixedEffects = bundle?.panelFixedEffects || null;
   const diffInDiff = bundle?.diffInDiff || null;
@@ -6878,25 +7010,26 @@ function generateDefaultTables(
 
   // Table 1: Descriptive statistics of numeric variables
   if (numericCols.length > 0 && methodAllowed(executableMethods, "descriptive_statistics")) {
-    const headers = ["Variable", "N", "Mean", "Std Dev", "Min", "Q1", "Median", "Q3", "Max", "Skewness"];
+    const headers = ["Variable", "N", "Mean", "Std Dev", "Min", "Q1", "Median", "Q3", "Max", "Skewness", "Source"];
     const rows: (string | number)[][] = [];
 
     for (const col of numericCols.slice(0, 20)) {
       const values = ds.data.map(r => Number(r[col])).filter(v => !isNaN(v));
-      if (values.length === 0) continue;
+      const fullSummary = ds.fullDataProfile?.numeric[col];
+      if (values.length === 0 && !fullSummary) continue;
       const sorted = [...values].sort((a, b) => a - b);
-      const n = values.length;
-      const mean = values.reduce((a, b) => a + b, 0) / n;
-      const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1 || 1);
-      const std = Math.sqrt(variance);
-      const median = n % 2 === 0 ? (sorted[n / 2 - 1] + sorted[n / 2]) / 2 : sorted[Math.floor(n / 2)];
-      const q1 = sorted[Math.floor(n * 0.25)];
-      const q3 = sorted[Math.floor(n * 0.75)];
+      const n = fullSummary?.n || values.length;
+      const mean = fullSummary ? streamingMean(fullSummary) : values.reduce((a, b) => a + b, 0) / Math.max(1, values.length);
+      const std = fullSummary ? streamingStdDev(fullSummary) : Math.sqrt(values.reduce((a, b) => a + (b - mean) ** 2, 0) / (values.length - 1 || 1));
+      const sampleN = sorted.length;
+      const median = sampleN > 0 ? (sampleN % 2 === 0 ? (sorted[sampleN / 2 - 1] + sorted[sampleN / 2]) / 2 : sorted[Math.floor(sampleN / 2)]) : mean;
+      const q1 = sampleN > 0 ? sorted[Math.floor(sampleN * 0.25)] : mean;
+      const q3 = sampleN > 0 ? sorted[Math.floor(sampleN * 0.75)] : mean;
 
       // Skewness
       let skewness = 0;
-      if (std > 0 && n > 2) {
-        const m3 = values.reduce((a, b) => a + ((b - mean) / std) ** 3, 0) / n;
+      if (std > 0 && values.length > 2) {
+        const m3 = values.reduce((a, b) => a + ((b - mean) / std) ** 3, 0) / values.length;
         skewness = m3;
       }
 
@@ -6907,19 +7040,22 @@ function generateDefaultTables(
         n,
         Math.round(mean * 1000) / 1000,
         Math.round(std * 1000) / 1000,
-        Math.round(sorted[0] * 1000) / 1000,
+        Math.round((fullSummary?.min ?? sorted[0] ?? mean) * 1000) / 1000,
         Math.round(q1 * 1000) / 1000,
         Math.round(median * 1000) / 1000,
         Math.round(q3 * 1000) / 1000,
-        Math.round(sorted[n - 1] * 1000) / 1000,
+        Math.round((fullSummary?.max ?? sorted[sorted.length - 1] ?? mean) * 1000) / 1000,
         Math.round(skewness * 1000) / 1000,
+        fullSummary ? `All scanned rows; quantiles from ${values.length.toLocaleString()} representative rows` : "Materialized rows",
       ]);
     }
 
     if (rows.length > 0) {
       tables.push({
         name: "descriptive_statistics",
-        description: "Descriptive statistics of numeric variables",
+        description: ds.fullDataProfile?.scannedRows
+          ? `Descriptive statistics using all ${ds.fullDataProfile.scannedRows.toLocaleString()} scanned rows for N/mean/std/min/max; quantiles use the bounded representative sample.`
+          : "Descriptive statistics of numeric variables",
         headers,
         rows,
       });
@@ -6929,19 +7065,25 @@ function generateDefaultTables(
   // Table 2: Cross-tabulation / frequency table of categorical columns
   if (categoricalCols.length > 0 && methodAllowed(executableMethods, "group_comparison")) {
     const catCol = categoricalCols[0];
-    const counts: Record<string, number> = {};
-    for (const row of ds.data) {
-      const key = String(row[catCol] ?? "N/A").slice(0, 50);
-      counts[key] = (counts[key] || 0) + 1;
+    const counts: Record<string, number> = ds.fullDataProfile?.categorical[catCol]
+      ? { ...ds.fullDataProfile.categorical[catCol] }
+      : {};
+    if (Object.keys(counts).length === 0) {
+      for (const row of ds.data) {
+        const key = String(row[catCol] ?? "N/A").slice(0, 50);
+        counts[key] = (counts[key] || 0) + 1;
+      }
     }
     const sortedKeys = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 30);
-    const total = ds.data.length;
+    const total = ds.fullDataProfile?.scannedRows || ds.data.length;
 
     const displayCatCol = catCol.length > 30 ? catCol.slice(0, 27) + "..." : catCol;
 
     tables.push({
       name: "frequency_table",
-      description: `Frequency distribution of ${displayCatCol}`,
+      description: ds.fullDataProfile?.scannedRows
+        ? `Frequency distribution of ${displayCatCol} using all ${ds.fullDataProfile.scannedRows.toLocaleString()} scanned rows`
+        : `Frequency distribution of ${displayCatCol}`,
       headers: [displayCatCol, "Count", "Percentage", "Cumulative %"],
       rows: (() => {
         let cumPct = 0;
@@ -7197,7 +7339,7 @@ function generateDefaultTables(
   if (robustOls && methodAllowed(executableMethods, "robust_ols")) {
     tables.push({
       name: "robust_ols_results",
-      description: `Multivariate OLS results for ${robustOls.yCol} on ${robustOls.xCol}${robustOls.controlCols.length > 0 ? ` with controls ${robustOls.controlCols.join(", ")}` : ""}`,
+      description: `Associational multivariate OLS for outcome ${robustOls.yCol} on regressor ${robustOls.xCol}${robustOls.controlCols.length > 0 ? ` with controls ${robustOls.controlCols.join(", ")}` : ""}; interpret causally only with a credible identification design.`,
       headers: ["Outcome", "Primary regressor", "Controls", "Coeff", "SE", "SE type", "Clusters", "p-value", "95% CI", "R2", "Adj R2", "N", "Missing-data"],
       rows: [[
         robustOls.yCol.length > 18 ? `${robustOls.yCol.slice(0, 15)}...` : robustOls.yCol,
@@ -7332,6 +7474,32 @@ function generateDefaultTables(
     });
   }
 
+  if (designHints) {
+    const causalOutputs = [
+      panelFixedEffects ? "panel_fixed_effects" : "",
+      diffInDiff ? "diff_in_diff/event_study" : "",
+      syntheticControl ? "synthetic_control" : "",
+      iv2Sls ? "iv_2sls" : "",
+      rdd ? "regression_discontinuity" : "",
+      propensityScore ? "propensity_score" : "",
+    ].filter(Boolean).join(", ") || "No credible causal estimator was feasible from detected columns";
+    tables.unshift({
+      name: "analysis_design_diagnostics",
+      description: "Design audit showing the chosen causal direction and whether causal estimators were feasible from the actual dataset columns.",
+      headers: ["Field", "Selected value", "Interpretation"],
+      rows: [
+        ["Outcome", designHints.primaryOutcomeCol || "Not detected", "Dependent variable; effects are reported as changes in this variable"],
+        ["Treatment / primary regressor", designHints.primaryTreatmentCol || designHints.primaryRegressorCol || "Not detected", "Candidate cause/exposure; never inferred from outcome-like variables"],
+        ["Entity ID", designHints.primaryEntityCol || "Not detected", "Required for panel FE, DiD, event study, or synthetic control"],
+        ["Time", designHints.primaryTimeCol || "Not detected", "Required for time-based causal designs"],
+        ["Controls", designHints.controlCols.length > 0 ? designHints.controlCols.join(", ") : "Auto-selected or none", "Included where model preparation permits"],
+        ["Feasible causal outputs", causalOutputs, "OLS is labelled associational unless one of these designs succeeds"],
+        ["Specified inputs matched", designHints.specifiedInputMatches.length > 0 ? designHints.specifiedInputMatches.join("; ") : "None", "User-provided inputs take priority over automatic inference"],
+        ["Specified inputs missing", designHints.specifiedInputMissing.length > 0 ? designHints.specifiedInputMissing.join("; ") : "None", "Missing user inputs are reported rather than silently replaced"],
+      ],
+    });
+  }
+
   if (quantileRegression && methodAllowed(executableMethods, "quantile_regression")) {
     tables.push({
       name: "quantile_regression_results",
@@ -7358,7 +7526,7 @@ function generateDefaultTables(
 }
 
 export function generateDefaultMetrics(
-  allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number }[],
+  allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number; fullDataProfile?: FullDataProfile }[],
   executableMethods: Set<string> | null,
   analysisTopic = "",
   analysisInputs?: AnalysisInputs,
@@ -7397,6 +7565,12 @@ export function generateDefaultMetrics(
   metrics.sample_waterfall_total_rows = ds.totalRows;
   metrics.sample_waterfall_rows_loaded = ds.data.length;
   metrics.sample_waterfall_rows_not_loaded = Math.max(0, ds.totalRows - ds.data.length);
+  if (ds.fullDataProfile?.scannedRows) {
+    metrics.full_data_rows_scanned = ds.fullDataProfile.scannedRows;
+    metrics.full_data_numeric_columns_summarized = Object.keys(ds.fullDataProfile.numeric).length;
+    metrics.full_data_categorical_columns_summarized = Object.keys(ds.fullDataProfile.categorical).length;
+    metrics.large_data_processing_mode = "streaming full-scan summaries plus bounded representative sample for model diagnostics";
+  }
 
   const meaningfulNumericCols = bundle.meaningfulNumericCols;
   const designHints = bundle.designHints;
@@ -7476,6 +7650,13 @@ export function generateDefaultMetrics(
   metrics.panel_fe_median_obs_per_entity = panelFeAssessment.diagnostics.medianObsPerEntity;
   metrics.panel_fe_max_obs_per_entity = panelFeAssessment.diagnostics.maxObsPerEntity;
   metrics.panel_fe_transformed_rows = panelFeAssessment.diagnostics.transformedRows;
+  metrics.design_selected_outcome = designHints.primaryOutcomeCol || "";
+  metrics.design_selected_treatment_or_regressor = designHints.primaryTreatmentCol || designHints.primaryRegressorCol || "";
+  metrics.design_selected_entity = designHints.primaryEntityCol || "";
+  metrics.design_selected_time = designHints.primaryTimeCol || "";
+  metrics.design_causal_direction = designHints.primaryOutcomeCol && (designHints.primaryTreatmentCol || designHints.primaryRegressorCol)
+    ? `${designHints.primaryOutcomeCol} <- ${designHints.primaryTreatmentCol || designHints.primaryRegressorCol}`
+    : "not established";
 
   if (methodAllowed(executableMethods, "descriptive_statistics")) {
     for (const col of meaningfulNumericCols.slice(0, 5)) {
