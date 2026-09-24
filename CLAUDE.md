@@ -48,6 +48,9 @@ Full-stack TypeScript app: React 19 + Vite frontend, Express + tRPC 11 backend, 
 - `server/pdf-generator.ts` — PDFKit-based PDF generation with embedded charts
 - `server/storage.ts` — S3 proxy via Forge API (`BUILT_IN_FORGE_API_URL`)
 - `server/_core/llm.ts` — centralized LLM calls via Forge chat completions (currently uses `gemini-2.5-flash`)
+- `server/chart-renderer.ts` — deterministic SVG chart renderer (bar/line/scatter/histogram/box/forest/heatmap/pie) with text-width-aware layout; rasterised to PNG in experiment-runner
+- `server/paper-assets.ts` — numbered figure/table manifests, LaTeX/Markdown typesetting of engine tables, and deterministic insertion at `[[FIGURE:n]]` / `[[TABLE:n]]` markers
+- `server/tabular-utils.ts` — ingestion helpers (delimiter detection, header dedupe, missing-code/NFKC normalisation, nested JSON/JSONL flattening, Excel title-row skipping, order-preserving reservoir sampling)
 - `server/dta-parser.ts` — Stata .dta file parser
 - `server/upload-procedures.ts` — tRPC mutations for chunked dataset upload (uploadChunk, assembleChunks, registerFile)
 
@@ -65,6 +68,8 @@ Chunked S3 proxy upload via tRPC mutations on the `datasets` router: client spli
 - **Status enums differ:** Run: `pending | running | completed | failed | stopped | awaiting_approval`. Stage: `pending | running | done | failed | blocked_approval | skipped`
 - **Anti-hallucination prompts in stages 12–20** prevent fabricated metrics/citations — preserve these guardrails when editing prompts
 - **Citation flow:** Stage 18 expects numbered citations → Stage 20 converts to LaTeX with bibliography integrity checks
+- **Figures/tables are never drawn or typeset by the LLM:** Stage 11 builds `ctx.figureManifest`/`ctx.tableManifest` from engine output; writing stages only place `[[FIGURE:n]]`/`[[TABLE:n]]` markers and `insertAssetsIntoLatex`/`insertAssetsIntoMarkdown` insert the real assets. Keep markers intact when rewriting prompts or post-processing text
+- **Reasoning chain:** Stage 1 data profile (`profileDatasetsForPlanning`) and `SEARCH_QUERY` → stages 2–8 consume prior outputs (`literatureSynthesis`, `researchGaps`) → Stage 9 LLM analysis design is validated against real columns before the deterministic plan
 - **If adding stages with context outputs**, update `updateContextFromEdit` in pipeline-engine so manual edits propagate
 - **Startup cleanup:** `cleanupStaleRuns()` marks `running/pending` runs as `failed` on server boot
 
