@@ -1079,6 +1079,7 @@ export function remapAnalysisInputs(inputs: AnalysisInputs | undefined, renameLo
     ...inputs,
     outcome: map(inputs.outcome),
     treatment: map(inputs.treatment),
+    keyExplanatory: map(inputs.keyExplanatory),
     entity: map(inputs.entity),
     time: map(inputs.time),
     subgroup: map(inputs.subgroup),
@@ -1465,7 +1466,11 @@ export async function executePythonExperiment(
         phase: "downloading_datasets",
         persist: true,
       });
-      await downloadFile(ds.fileUrl, localPath, ds.fileKey, ds.sizeBytes);
+      if (claimPlanningDownload(runId, ds, localPath)) {
+        await publishProgress(`[INFO] Reusing file downloaded during data profiling: ${ds.originalName}`);
+      } else {
+        await downloadFile(ds.fileUrl, localPath, ds.fileKey, ds.sizeBytes);
+      }
       await publishProgress(`[INFO] Downloaded: ${ds.originalName}`, {
         phase: "parsing_datasets",
         persist: true,
@@ -1953,6 +1958,7 @@ export async function executePythonExperiment(
     });
 
     try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+    releasePlanningDownloads(runId);
     return output;
 
   } catch (err: any) {
@@ -1985,6 +1991,7 @@ export async function executePythonExperiment(
     });
 
     try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+    releasePlanningDownloads(runId);
     return output;
   }
 }
@@ -2032,10 +2039,11 @@ export function isIdOrCodeColumn(col: string, data: Record<string, any>[]): bool
   const uniqueCount = new Set(values).size;
   if (uniqueCount / values.length > 0.9 && values.length > 20 && !looksLikeMeasure) return true;
 
-  // If values are small integers (1-50) with few unique values, likely a code (e.g., prefecture 1-47)
+  // Complete runs of many small integers (e.g. prefecture codes 1-47) are likely codes.
+  // Short runs are indicators (0/1) or rating scales (1-5, 0-10) and must stay numeric.
   const min = Math.min(...values);
   const max = Math.max(...values);
-  if (min >= 0 && max <= 100 && uniqueCount <= 50 && uniqueCount === (max - min + 1)) {
+  if (min >= 0 && max <= 100 && uniqueCount >= 15 && uniqueCount <= 50 && uniqueCount === (max - min + 1)) {
     // Looks like a sequential code (e.g., prefecture 1-47)
     // Only flag if the column name doesn't suggest a meaningful measure
     if (!looksLikeMeasure) return true;
@@ -2179,7 +2187,11 @@ function isPathologicalNumericColumn(ds: ParsedDataset, col: string): boolean {
   const maxValueCount = absValues.filter(value => value === maxAbs).length;
   const repeatedExtremeShare = maxValueCount / values.length;
   const zeroOrSentinelDominance = values.filter(value => value === 0 || Math.abs(value) >= 1e20).length / values.length;
-  return maxAbs >= 1e20 || extremeShare >= 0.25 || repeatedExtremeShare >= 0.4 || zeroOrSentinelDominance >= 0.75;
+  // A repeated maximum is normal for indicators and rating scales; it only signals a
+  // sentinel code (e.g. 9999999) for large values in otherwise varied columns.
+  const distinct = new Set(values).size;
+  const sentinelLike = repeatedExtremeShare >= 0.4 && distinct > 10 && maxAbs >= 1000;
+  return maxAbs >= 1e20 || extremeShare >= 0.25 || sentinelLike || (zeroOrSentinelDominance >= 0.75 && distinct > 2);
 }
 
 function rankMeaningfulNumericColumns(
@@ -2487,22 +2499,22 @@ function mergeAnalysisInputsIntoDesignHints(
 
   const resolvedOutcome = resolveAndTrack("outcome", analysisInputs.outcome);
   const resolvedTreatment = resolveAndTrack("treatment", analysisInputs.treatment);
+  const resolvedKeyExplanatory = resolveAndTrack("key_explanatory", analysisInputs.keyExplanatory);
   const resolvedEntity = resolveAndTrack("entity", analysisInputs.entity);
   const resolvedTime = resolveAndTrack("time", analysisInputs.time);
   const resolvedSubgroup = resolveAndTrack("subgroup", analysisInputs.subgroup);
   const resolvedControls = uniqueDefinedColumns(
     (analysisInputs.controls || []).map(control => resolveAndTrack("control", control))
-  ).filter(column => column !== resolvedOutcome && column !== resolvedTreatment);
+  ).filter(column => column !== resolvedOutcome && column !== resolvedTreatment && column !== resolvedKeyExplanatory);
 
   const primaryOutcomeCol = resolvedOutcome || hints.primaryOutcomeCol;
   const primaryTreatmentCol = resolvedTreatment || hints.primaryTreatmentCol;
-  const primaryRegressorCol = (
-    primaryTreatmentCol && primaryTreatmentCol !== primaryOutcomeCol
-      ? primaryTreatmentCol
-      : hints.primaryRegressorCol && hints.primaryRegressorCol !== primaryOutcomeCol
-        ? hints.primaryRegressorCol
-        : resolvedControls.find(column => column !== primaryOutcomeCol)
-  ) || hints.primaryRegressorCol;
+  // Priority: specified treatment > specified key explanatory variable > detected
+  // treatment > heuristic regressor > first specified control.
+  const regressorCandidates = [resolvedTreatment, resolvedKeyExplanatory, primaryTreatmentCol, hints.primaryRegressorCol];
+  const primaryRegressorCol = regressorCandidates.find(column => column && column !== primaryOutcomeCol)
+    || resolvedControls.find(column => column !== primaryOutcomeCol)
+    || hints.primaryRegressorCol;
 
   return {
     ...hints,
@@ -2781,6 +2793,9 @@ interface QuantileRegressionEstimate {
   bootstrapReplicates: number;
 }
 
+const QUANTILE_REGRESSION_MAX_ROWS = 5000;
+const QUANTILE_BOOTSTRAP_MAX_ROWS = 1200;
+
 interface QuantileRegressionResult {
   xCol: string;
   yCol: string;
@@ -2789,6 +2804,8 @@ interface QuantileRegressionResult {
   omittedControlCols: string[];
   droppedCollinearCols: string[];
   n: number;
+  /** Complete-case rows available when the estimation used an evenly spaced subsample. */
+  sampledFrom?: number;
   vcovType: "bootstrap";
   clusterCol?: string;
   clusterCount?: number;
@@ -2913,7 +2930,9 @@ function detectOutcomeColumns(ds: ParsedDataset, numericCols: string[], topic?: 
 }
 
 function detectInstrumentColumns(ds: ParsedDataset): string[] {
-  return ds.columns.filter(c => /(instrument|iv|encouragement|eligib|distance|shiftshare|shock|assignment)/i.test(c));
+  // "iv" must be a separate token: a bare substring match flagged columns such as
+  // "productivity" or "positive" as instruments and removed them from the outcome pool.
+  return ds.columns.filter(c => /(instrument|encouragement|eligib|shift.?share|lottery|(^|[^a-z])iv([^a-z]|$)|distance.?to|dist.?to)/i.test(c));
 }
 
 function detectRunningVariableColumns(ds: ParsedDataset, numericCols: string[]): string[] {
@@ -3296,7 +3315,13 @@ function computeBootstrapStandardErrors(
   }
   const clusterKeys = Array.from(clusterMap.keys()).filter(Boolean);
   const useClusterBootstrap = clusterKeys.length >= Math.max(8, observations[0].x.length + 2);
-  const targetReplicates = observations.length > 1500 ? 18 : observations.length > 600 ? 24 : 36;
+  const targetReplicates = observations.length > 1500 ? 20 : observations.length > 600 ? 24 : 36;
+  // m-out-of-n bootstrap for large samples: resample m < n units and rescale the spread
+  // by sqrt(m / n), which keeps replicate fits cheap without biasing the standard errors.
+  const resampleFraction = Math.min(1, QUANTILE_BOOTSTRAP_MAX_ROWS / observations.length);
+  const clusterDraws = useClusterBootstrap ? Math.max(8, Math.round(clusterKeys.length * resampleFraction)) : 0;
+  const rowDraws = Math.max(40, Math.round(observations.length * resampleFraction));
+  const replicateIterations = resampleFraction < 1 ? 700 : 900;
   const minSuccessfulReplicates = Math.max(12, Math.floor(targetReplicates * 0.6));
   const rng = createDeterministicRng(
     Math.round(tau * 1000) * 97 + observations.length * 13 + coefficientCount * 31 + clusterKeys.length * 7
@@ -3306,16 +3331,16 @@ function computeBootstrapStandardErrors(
   for (let rep = 0; rep < targetReplicates; rep++) {
     let sampledRows: PreparedRegressionRow[] = [];
     if (useClusterBootstrap) {
-      const sampledClusterIndexes = sampleWithReplacement(clusterKeys.length, clusterKeys.length, rng);
+      const sampledClusterIndexes = sampleWithReplacement(clusterKeys.length, clusterDraws, rng);
       sampledRows = sampledClusterIndexes.flatMap(index => {
         const clusterId = clusterKeys[index];
         return (clusterMap.get(clusterId) || []).map(row => ({ ...row }));
       });
     } else {
-      const sampledIndexes = sampleWithReplacement(observations.length, observations.length, rng);
+      const sampledIndexes = sampleWithReplacement(observations.length, rowDraws, rng);
       sampledRows = sampledIndexes.map(index => ({ ...observations[index] }));
     }
-    const fit = fitQuantileRegressionModel(sampledRows, tau, 900);
+    const fit = fitQuantileRegressionModel(sampledRows, tau, replicateIterations);
     if (!fit) continue;
     const coefficientVector = [fit.intercept, ...fit.slopes];
     if (coefficientVector.length !== coefficientCount || !coefficientVector.every(value => isFinite(value))) continue;
@@ -3323,9 +3348,11 @@ function computeBootstrapStandardErrors(
   }
 
   if (bootstrapCoefficients.length < minSuccessfulReplicates) return null;
+  const effectiveFraction = useClusterBootstrap ? clusterDraws / clusterKeys.length : rowDraws / observations.length;
+  const scale = Math.sqrt(Math.min(1, effectiveFraction));
   const standardErrors = Array.from({ length: coefficientCount }, (_, index) => {
     const values = bootstrapCoefficients.map(row => row[index]);
-    return stdDev(values);
+    return stdDev(values) * scale;
   });
   if (!standardErrors.every(value => isFinite(value) && value >= 0)) return null;
   return {
@@ -4855,11 +4882,15 @@ function computeQuantileRegression(
   const primaryActiveIndex = prepared.regressorCols.findIndex(column => column === prepared.primaryRegressorCol);
   if (primaryActiveIndex < 0 || !activeIndexes.includes(primaryActiveIndex)) return null;
 
-  const activeRows = prepared.rows.map(row => ({
+  const allActiveRows = prepared.rows.map(row => ({
     y: row.y,
     x: activeIndexes.map(index => row.x[index]),
     clusterId: row.clusterId,
   }));
+  // The smoothed-gradient solver costs O(iterations x n x p); estimate on an evenly spaced
+  // subsample for very large data (reported as the estimation n) to keep runtime bounded.
+  const stride = Math.max(1, Math.ceil(allActiveRows.length / QUANTILE_REGRESSION_MAX_ROWS));
+  const activeRows = stride > 1 ? allActiveRows.filter((_, index) => index % stride === 0) : allActiveRows;
   const activeRegressorCols = activeIndexes.map(index => prepared.regressorCols[index]);
   const droppedCollinearCols = prepared.regressorCols.filter((_, index) => !activeIndexes.includes(index));
 
@@ -4885,8 +4916,8 @@ function computeQuantileRegression(
           se,
           tStat,
           pValue,
-          ciLower: coefficientVector[index] - 1.96 * se,
-          ciUpper: coefficientVector[index] + 1.96 * se,
+          ciLower: coefficientVector[index] - studentTCritical(degreesOfFreedom) * se,
+          ciUpper: coefficientVector[index] + studentTCritical(degreesOfFreedom) * se,
         };
       });
       const primaryEstimate = coefficients[primaryIndex + 1];
@@ -4917,6 +4948,7 @@ function computeQuantileRegression(
     omittedControlCols: uniqueColumns([...prepared.omittedControlCols, ...droppedCollinearCols]),
     droppedCollinearCols,
     n: activeRows.length,
+    sampledFrom: stride > 1 ? allActiveRows.length : undefined,
     vcovType: "bootstrap",
     clusterCol: clusterIds.length >= Math.max(8, activeRegressorCols.length + 1) ? prepared.clusterCol : undefined,
     clusterCount: clusterIds.length >= Math.max(8, activeRegressorCols.length + 1) ? clusterIds.length : undefined,
@@ -5873,7 +5905,8 @@ export function generateDefaultCharts(
   if (groupCol && methodAllowed(executableMethods, "descriptive_statistics")) {
     const counts = categoryCounts(ds, groupCol);
     const entries = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
-    if (entries.length >= 2) {
+    // Two categories are better reported as numbers (frequency table) than as a two-bar chart.
+    if (entries.length >= 3) {
       const total = entries.reduce((sum, [, c]) => sum + c, 0);
       const top = entries.slice(0, 12);
       const rest = entries.slice(12).reduce((sum, [, c]) => sum + c, 0);
@@ -6838,7 +6871,10 @@ export function generateDefaultTables(
       headers: ["Role", "Variable", "Notes"],
       rows: [
         ["Outcome", designHints.primaryOutcomeCol || "Not identified", "Dependent variable in all models"],
-        ["Key explanatory variable", designHints.primaryTreatmentCol || designHints.primaryRegressorCol || "Not identified", designHints.primaryTreatmentCol ? "Treatment / exposure indicator" : "Primary regressor"],
+        ["Key explanatory variable", designHints.primaryRegressorCol || designHints.primaryTreatmentCol || "Not identified", designHints.primaryRegressorCol && designHints.primaryRegressorCol === designHints.primaryTreatmentCol ? "Treatment / exposure indicator" : "Primary regressor"],
+        ...(designHints.primaryTreatmentCol && designHints.primaryTreatmentCol !== designHints.primaryRegressorCol
+          ? [["Treatment indicator", designHints.primaryTreatmentCol, "Used by the causal designs (DiD, event study, weighting)"]]
+          : []),
         ["Controls", designHints.controlCols.length > 0 ? designHints.controlCols.join(", ") : "None", [
           designHints.controlsAutoSelected ? "Selected automatically (plausible covariates; no controls were specified)" : "As specified",
           "categorical controls enter as indicators against the most frequent level",
@@ -7222,7 +7258,7 @@ export function generateDefaultTables(
         formatPValue(estimate.pValue),
         estimate.pseudoR1.toFixed(3),
       ])),
-      notes: `Dependent variable: ${quantileRegression.yCol}; coefficient on ${quantileRegression.xCol}${quantileRegression.controlCols.length ? ` controlling for ${quantileRegression.controlCols.join(", ")}` : ""}. Bootstrap standard errors (${quantileRegression.estimates[0]?.bootstrapReplicates ?? 0} replications); n = ${formatCount(quantileRegression.n)}. * p < 0.05, ** p < 0.01, *** p < 0.001.`,
+      notes: `Dependent variable: ${quantileRegression.yCol}; coefficient on ${quantileRegression.xCol}${quantileRegression.controlCols.length ? ` controlling for ${quantileRegression.controlCols.join(", ")}` : ""}. Bootstrap standard errors (${quantileRegression.estimates[0]?.bootstrapReplicates ?? 0} replications); n = ${formatCount(quantileRegression.n)}${quantileRegression.sampledFrom ? ` (evenly spaced subsample of ${formatCount(quantileRegression.sampledFrom)} complete cases)` : ""}. * p < 0.05, ** p < 0.01, *** p < 0.001.`,
     });
   }
 
@@ -7827,4 +7863,253 @@ export function generateDefaultMetrics(
   }
 
   return metrics;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Early data profiling for the planning stages                       */
+/* ------------------------------------------------------------------ */
+
+export type ColumnKind = "continuous" | "discrete" | "binary" | "categorical" | "text" | "datetime" | "identifier" | "empty";
+
+export interface ColumnProfile {
+  name: string;
+  kind: ColumnKind;
+  missingPct: number;
+  distinct: number;
+  summary: string;
+}
+
+export interface DatasetProfile {
+  name: string;
+  fileType: string;
+  rows: number;
+  columns: number;
+  retainedRows: number;
+  parseNote: string;
+  columnProfiles: ColumnProfile[];
+  timeColumns: string[];
+  entityColumns: string[];
+  textColumns: string[];
+  treatmentCandidates: string[];
+  panel?: { entity: string; time: string; entities: number; periods: number; balanced: boolean };
+  suggestedRoles: { outcome?: string; keyExplanatory?: string; treatment?: string; controls: string[]; group?: string; entity?: string; time?: string };
+}
+
+export interface DataProfileBundle {
+  datasets: DatasetProfile[];
+  /** Compact data dictionary for LLM prompts. */
+  text: string;
+}
+
+/** Downloads fetched during planning, reused by stage 11 so large files are fetched once. */
+const planningDownloadCache = new Map<string, { path: string; createdAt: number }>();
+const PLANNING_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+function planningCacheKey(runId: string, ds: DatasetInfo): string {
+  return `${runId}::${ds.fileKey || ds.fileUrl}`;
+}
+
+function sweepPlanningCache(): void {
+  const now = Date.now();
+  planningDownloadCache.forEach((entry, key) => {
+    if (now - entry.createdAt > PLANNING_CACHE_TTL_MS) {
+      try { fs.unlinkSync(entry.path); } catch {}
+      planningDownloadCache.delete(key);
+    }
+  });
+}
+
+/** Moves a planning-stage download into place if one exists; returns true on success. */
+function claimPlanningDownload(runId: string, ds: DatasetInfo, destination: string): boolean {
+  const key = planningCacheKey(runId, ds);
+  const entry = planningDownloadCache.get(key);
+  if (!entry) return false;
+  planningDownloadCache.delete(key);
+  try {
+    if (!fs.existsSync(entry.path)) return false;
+    try {
+      fs.renameSync(entry.path, destination);
+    } catch {
+      fs.copyFileSync(entry.path, destination);
+      try { fs.unlinkSync(entry.path); } catch {}
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Removes any planning downloads still held for a run (e.g. when execution is skipped). */
+export function releasePlanningDownloads(runId: string): void {
+  planningDownloadCache.forEach((entry, key) => {
+    if (key.startsWith(`${runId}::`)) {
+      try { fs.unlinkSync(entry.path); } catch {}
+      planningDownloadCache.delete(key);
+    }
+  });
+}
+
+function describeColumn(ds: ParsedDataset, col: string, context: { idCols: string[]; textCols: string[]; timeCols: string[] }): ColumnProfile {
+  const total = Math.max(1, ds.data.length);
+  let missing = 0;
+  for (const row of ds.data) if (isMissingValue(row[col])) missing++;
+  const missingPct = (missing / total) * 100;
+  const distinctSample = sampleDistinctValues(ds, col, 500);
+  const distinct = distinctSample.length;
+  const base = { name: col, missingPct, distinct };
+  if (distinct === 0) return { ...base, kind: "empty", summary: "all values missing" };
+  if (context.idCols.includes(col)) return { ...base, kind: "identifier", summary: `${distinct >= 500 ? "500+" : distinct} distinct codes` };
+  if (context.textCols.includes(col)) {
+    return { ...base, kind: "text", summary: `free text, mean length ${Math.round(averageTextLength(ds, col))} characters` };
+  }
+  const numeric = numericValuesOf(ds, col);
+  const nonMissing = total - missing;
+  const numericShare = nonMissing > 0 ? numeric.length / nonMissing : 0;
+  if (context.timeCols.includes(col) && (numericShare < 0.9 || numeric.every(v => Number.isInteger(v)))) {
+    const sorted = distinctSample.slice().sort();
+    return { ...base, kind: "datetime", summary: `time index, ${distinct >= 500 ? "500+" : distinct} distinct values (${sorted[0]} to ${sorted[sorted.length - 1]})` };
+  }
+  if (numericShare >= 0.9) {
+    const summary = summariseValues(numeric);
+    if (isBinaryLikeColumn(ds, col)) {
+      const ones = numeric.filter(v => v === 1).length;
+      return { ...base, kind: "binary", summary: `0/1 indicator, ${((ones / Math.max(1, numeric.length)) * 100).toFixed(1)}% = 1` };
+    }
+    if (summary) {
+      const kind: ColumnKind = distinct <= 10 && numeric.every(v => Number.isInteger(v)) ? "discrete" : "continuous";
+      return {
+        ...base,
+        kind,
+        summary: `mean ${formatNumber(summary.mean)}, SD ${formatNumber(summary.sd)}, min ${formatNumber(summary.min)}, median ${formatNumber(summary.median)}, max ${formatNumber(summary.max)}`,
+      };
+    }
+  }
+  const counts = Array.from(categoryCounts(ds, col).entries()).sort((a, b) => b[1] - a[1]);
+  const countTotal = counts.reduce((sum, [, c]) => sum + c, 0) || 1;
+  if (counts.length === 2 && isBinaryLikeColumn(ds, col)) {
+    return { ...base, kind: "binary", summary: counts.map(([k, c]) => `${k} ${((c / countTotal) * 100).toFixed(0)}%`).join(", ") };
+  }
+  const top = counts.slice(0, 5).map(([k, c]) => `${k.slice(0, 24)} ${((c / countTotal) * 100).toFixed(0)}%`).join(", ");
+  return { ...base, kind: "categorical", summary: `${counts.length}${counts.length >= 200 ? "+" : ""} levels: ${top}${counts.length > 5 ? ", ..." : ""}` };
+}
+
+function detectPanelStructure(ds: ParsedDataset, entity?: string, time?: string): DatasetProfile["panel"] {
+  if (!entity || !time) return undefined;
+  const perEntity = new Map<string, Set<string>>();
+  const periods = new Set<string>();
+  for (const row of ds.data) {
+    const e = categoryKey(row[entity]);
+    const t = categoryKey(row[time]);
+    if (e === null || t === null) continue;
+    periods.add(t);
+    const set = perEntity.get(e) || new Set<string>();
+    set.add(t);
+    perEntity.set(e, set);
+  }
+  if (perEntity.size < 2 || periods.size < 2) return undefined;
+  const repeated = Array.from(perEntity.values()).filter(set => set.size >= 2).length;
+  if (repeated < Math.max(2, perEntity.size * 0.3)) return undefined;
+  const balanced = Array.from(perEntity.values()).every(set => set.size === periods.size);
+  return { entity, time, entities: perEntity.size, periods: periods.size, balanced };
+}
+
+export function buildDatasetProfile(ds: ParsedDataset & { fileType?: string; parseNote?: string }, topic = "", analysisInputs?: AnalysisInputs): DatasetProfile {
+  const { idCols } = classifyColumns(ds.data, ds.columns);
+  const textCols = detectTextColumns(ds);
+  const timeCols = detectTimeColumnsFromDataset(ds);
+  const bundle = buildAnalysisComputationBundle([ds], topic, analysisInputs, new Set(["descriptive_statistics"]));
+  const hints = bundle?.designHints;
+  const columnProfiles = ds.columns.map(col => describeColumn(ds, col, { idCols, textCols, timeCols }));
+  const entityColumns = uniqueDefinedColumns([hints?.primaryEntityCol, ...(hints?.entityCols || []).filter(col => columnRepeatsAcrossRows(ds, col))]).slice(0, 4);
+  const panel = detectPanelStructure(ds, hints?.primaryEntityCol, hints?.primaryTimeCol);
+  const groupCol = bundle ? chooseGroupingColumn(ds, bundle, [], topic) : undefined;
+  return {
+    name: ds.name,
+    fileType: ds.fileType || "",
+    rows: ds.totalRows,
+    columns: ds.columns.length,
+    retainedRows: ds.data.length,
+    parseNote: ds.parseNote || "",
+    columnProfiles,
+    timeColumns: timeCols,
+    entityColumns,
+    textColumns: textCols,
+    treatmentCandidates: (hints?.treatmentCols || []).slice(0, 5),
+    panel,
+    suggestedRoles: {
+      outcome: hints?.primaryOutcomeCol,
+      keyExplanatory: hints?.primaryRegressorCol,
+      treatment: hints?.primaryTreatmentCol,
+      controls: hints?.controlCols || [],
+      group: groupCol,
+      entity: hints?.primaryEntityCol,
+      time: hints?.primaryTimeCol,
+    },
+  };
+}
+
+export function renderDataProfileText(profiles: DatasetProfile[], maxColumnsPerDataset = 60): string {
+  return profiles.map((p, index) => {
+    const structure = p.panel
+      ? `panel: ${formatCount(p.panel.entities)} units (${p.panel.entity}) x ${p.panel.periods} periods (${p.panel.time}), ${p.panel.balanced ? "balanced" : "unbalanced"}`
+      : p.timeColumns.length > 0
+        ? `repeated cross-section / time series (time: ${p.timeColumns.slice(0, 3).join(", ")})`
+        : "cross-sectional";
+    const kindOrder: Record<ColumnKind, number> = { continuous: 0, binary: 1, discrete: 2, categorical: 3, datetime: 4, text: 5, identifier: 6, empty: 7 };
+    const columns = p.columnProfiles
+      .slice()
+      .sort((a, b) => kindOrder[a.kind] - kindOrder[b.kind])
+      .slice(0, maxColumnsPerDataset);
+    const lines = [
+      `Dataset ${index + 1}: "${p.name}" - ${formatCount(p.rows)} rows x ${p.columns} columns${p.retainedRows < p.rows ? ` (${formatCount(p.retainedRows)}-row representative sample retained for modelling)` : ""}${p.parseNote ? ` [${p.parseNote}]` : ""}`,
+      `Structure: ${structure}`,
+      p.entityColumns.length ? `Repeated unit identifiers: ${p.entityColumns.join(", ")}` : "Repeated unit identifiers: none detected",
+      p.textColumns.length ? `Free-text columns: ${p.textColumns.join(", ")}` : "",
+      p.treatmentCandidates.length ? `Treatment/exposure-like indicators: ${p.treatmentCandidates.join(", ")}` : "Treatment/exposure-like indicators: none detected",
+      "Columns (name | type | missing | summary):",
+      ...columns.map(c => `- ${c.name} | ${c.kind} | ${c.missingPct.toFixed(1)}% | ${c.summary}`),
+      p.columnProfiles.length > columns.length ? `- ... ${p.columnProfiles.length - columns.length} further columns omitted` : "",
+      `Heuristic role suggestions (to be confirmed or overridden by the analysis design): outcome=${p.suggestedRoles.outcome || "?"}; key explanatory=${p.suggestedRoles.keyExplanatory || "?"}; treatment=${p.suggestedRoles.treatment || "none"}; grouping=${p.suggestedRoles.group || "none"}; controls=${p.suggestedRoles.controls.join(", ") || "none"}`,
+    ];
+    return lines.filter(Boolean).join("\n");
+  }).join("\n\n");
+}
+
+/**
+ * Downloads and parses each dataset once at the start of the pipeline and returns a
+ * value-based profile (types, missingness, panel structure, candidate roles). The
+ * downloaded files are kept for stage 11 so large uploads are not fetched twice.
+ */
+export async function profileDatasetsForPlanning(
+  runId: string,
+  datasets: DatasetInfo[],
+  topic = "",
+  analysisInputs?: AnalysisInputs,
+  options: { timeoutMs?: number } = {},
+): Promise<DataProfileBundle> {
+  sweepPlanningCache();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error("Data profiling timed out")), options.timeoutMs ?? 4 * 60_000);
+  const profiles: DatasetProfile[] = [];
+  const workDir = path.join(os.tmpdir(), `profile-${runId}-${nanoid(6)}`);
+  fs.mkdirSync(workDir, { recursive: true });
+  try {
+    for (const info of datasets) {
+      if (controller.signal.aborted) break;
+      const localPath = path.join(workDir, info.originalName.replace(/[^\w.\-]+/g, "_"));
+      try {
+        await downloadFile(info.fileUrl, localPath, info.fileKey, info.sizeBytes);
+        const parsed = await parseAndValidateDataFile(localPath, info.fileType, info.rowCount, { signal: controller.signal });
+        planningDownloadCache.set(planningCacheKey(runId, info), { path: localPath, createdAt: Date.now() });
+        profiles.push(buildDatasetProfile({ name: info.originalName, ...parsed, fileType: info.fileType, parseNote: parsed.encoding || "" }, topic, analysisInputs));
+      } catch (err: any) {
+        console.warn(`[Profile] Could not profile ${info.originalName}: ${err?.message}`);
+        try { fs.unlinkSync(localPath); } catch {}
+      }
+      try { global.gc?.(); } catch {}
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+  return { datasets: profiles, text: renderDataProfileText(profiles) };
 }

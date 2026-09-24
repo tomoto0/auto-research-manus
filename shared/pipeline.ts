@@ -73,6 +73,8 @@ export interface PipelineEvent {
 export interface AnalysisInputs {
   outcome?: string;
   treatment?: string;
+  /** Main explanatory variable when it is not a binary treatment (set by the analysis-design step). */
+  keyExplanatory?: string;
   entity?: string;
   time?: string;
   controls?: string[];

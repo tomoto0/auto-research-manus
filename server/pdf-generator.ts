@@ -141,6 +141,7 @@ interface PaperSection {
   headers?: string[];
   rows?: string[][];
   tableCaption?: string;
+  notes?: string;
 }
 
 function extractLatexCommandArgument(source: string, commandName: string): string | null {
@@ -167,7 +168,7 @@ function extractLatexCommandArgument(source: string, commandName: string): strin
   return null;
 }
 
-function parseLatexToSections(
+export function parseLatexToSections(
   latexSource: string,
   title: string,
   conference: string,
@@ -195,7 +196,7 @@ function parseLatexToSections(
   const labelMap = new Map<string, string>();
   let figNum = 0, tabNum = 0;
   // Scan for figure labels
-  const figEnvRegex = /\\begin\{figure\}[\s\S]*?\\end\{figure\}/g;
+  const figEnvRegex = /\\begin\{figure\*?\}[\s\S]*?\\end\{figure\*?\}/g;
   let figMatch: RegExpExecArray | null;
   while ((figMatch = figEnvRegex.exec(tex)) !== null) {
     figNum++;
@@ -206,7 +207,7 @@ function parseLatexToSections(
     }
   }
   // Scan for table labels
-  const tabEnvRegex = /\\begin\{table\}[\s\S]*?\\end\{table\}/g;
+  const tabEnvRegex = /\\begin\{table\*?\}[\s\S]*?\\end\{table\*?\}/g;
   let tabMatch: RegExpExecArray | null;
   while ((tabMatch = tabEnvRegex.exec(tex)) !== null) {
     tabNum++;
@@ -368,7 +369,7 @@ function parseLatexToSections(
   let figureCounter = 0;
   const figureMap = new Map<string, PaperSection>();
   body = body.replace(
-    /\\begin\{figure\}(?:\[([^\]]*)\])?([\s\S]*?)\\end\{figure\}/g,
+    /\\begin\{figure\*?\}(?:\[([^\]]*)\])?([\s\S]*?)\\end\{figure\*?\}/g,
     (_match, _placement, content) => {
       figureCounter++;
       const marker = `__FIGURE_${figureCounter}__`;
@@ -387,9 +388,9 @@ function parseLatexToSections(
         else if (src.startsWith("http")) imageUrl = src;
       }
 
-      // Extract caption
-      const capMatch = content.match(/\\caption\{([^}]*)\}/);
-      const caption = capMatch ? cleanLatexInline(capMatch[1]) : `Figure ${figureCounter}`;
+      // Extract caption (balanced braces: captions often contain \textit{...} or maths)
+      const captionArg = extractLatexCommandArgument(content, "caption");
+      const caption = captionArg ? cleanLatexInline(captionArg) : `Figure ${figureCounter}`;
 
       figureMap.set(marker, {
         type: "figure",
@@ -405,48 +406,21 @@ function parseLatexToSections(
   let tableCounter = 0;
   const tableMap = new Map<string, PaperSection>();
   body = body.replace(
-    /\\begin\{table\}(?:\[([^\]]*)\])?([\s\S]*?)\\end\{table\}/g,
+    /\\begin\{table\*?\}(?:\[([^\]]*)\])?([\s\S]*?)\\end\{table\*?\}/g,
     (_match, _placement, content) => {
       tableCounter++;
       const marker = `__TABLE_${tableCounter}__`;
-
-      // Extract caption
-      const capMatch = content.match(/\\caption\{([^}]*)\}/);
-      const tableCaption = capMatch ? cleanLatexInline(capMatch[1]) : `Table ${tableCounter}`;
-
-      // Remove non-tabular content
-      let cleanContent = content
-        .replace(/\\centering\s*/g, "")
-        .replace(/\\caption\*?\{[^}]*\}\s*/g, "")
-        .replace(/\\label\{[^}]*\}\s*/g, "")
-        .replace(/\\sisetup\{[^}]*\}\s*/g, "");
-
-      // Extract tabular content
-      const tabMatch = cleanContent.match(/\\begin\{(?:tabular|tabularx)\}(?:\{[^}]*\})?\{([^}]*)\}([\s\S]*?)\\end\{(?:tabular|tabularx)\}/);
-      // Also handle resizebox wrapping
-      const resizeMatch = cleanContent.match(/\\resizebox\{[^}]*\}\{[^}]*\}\{[\s\S]*?\\begin\{(?:tabular|tabularx)\}(?:\{[^}]*\})?\{([^}]*)\}([\s\S]*?)\\end\{(?:tabular|tabularx)\}[\s\S]*?\}/);
-      // Also handle adjustbox wrapping
-      const adjustMatch = cleanContent.match(/\\begin\{adjustbox\}\{[^}]*\}[\s\S]*?\\begin\{(?:tabular|tabularx)\}(?:\{[^}]*\})?\{([^}]*)\}([\s\S]*?)\\end\{(?:tabular|tabularx)\}[\s\S]*?\\end\{adjustbox\}/);
-
-      const actualMatch = resizeMatch || adjustMatch || tabMatch;
-
-      if (actualMatch) {
-        const tabContent = actualMatch[2];
-        const { headers, rows } = parseTabularContent(tabContent);
-        tableMap.set(marker, {
-          type: "table",
-          headers,
-          rows,
-          tableCaption: `Table ${tableCounter}: ${tableCaption}`,
-        });
-      } else {
-        tableMap.set(marker, {
-          type: "table",
-          headers: [],
-          rows: [],
-          tableCaption: `Table ${tableCounter}: ${tableCaption}`,
-        });
-      }
+      const captionArg = extractLatexCommandArgument(content, "caption");
+      const tableCaption = captionArg ? cleanLatexInline(captionArg) : `Table ${tableCounter}`;
+      const tabular = extractTabularEnvironment(content);
+      const parsed = tabular ? parseTabularContent(tabular.body) : { headers: [], rows: [] };
+      tableMap.set(marker, {
+        type: "table",
+        headers: parsed.headers,
+        rows: parsed.rows,
+        tableCaption: `Table ${tableCounter}: ${tableCaption}`,
+        notes: extractTableNotes(content, tabular),
+      });
       return `\n${marker}\n`;
     }
   );
@@ -608,20 +582,128 @@ function parseLatexToSections(
   return filtered;
 }
 
+/** Reads a balanced {...} group starting at `index` (which must point at "{"). */
+function readBalancedGroup(source: string, index: number): { value: string; end: number } | null {
+  if (source[index] !== "{") return null;
+  let depth = 0;
+  for (let i = index; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === "\\") { i++; continue; }
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return { value: source.slice(index + 1, i), end: i + 1 };
+    }
+  }
+  return null;
+}
+
+/**
+ * Locates the tabular / tabularx / tabular* / longtable body, tolerating column
+ * specifications with nested braces such as {l p{3cm} c}.
+ */
+function extractTabularEnvironment(content: string): { body: string; start: number; end: number } | null {
+  const begin = /\\begin\{(tabularx|tabular\*|tabular|longtable)\}/.exec(content);
+  if (!begin) return null;
+  const env = begin[1];
+  let cursor = begin.index + begin[0].length;
+  const skipSpaces = () => { while (/\s/.test(content[cursor] || "")) cursor++; };
+  skipSpaces();
+  if (content[cursor] === "[") {
+    const close = content.indexOf("]", cursor);
+    if (close > 0) cursor = close + 1;
+    skipSpaces();
+  }
+  // tabularx / tabular* take a width argument before the column spec.
+  const groups = env === "tabularx" || env === "tabular*" ? 2 : 1;
+  for (let g = 0; g < groups; g++) {
+    skipSpaces();
+    const group = readBalancedGroup(content, cursor);
+    if (!group) break;
+    cursor = group.end;
+  }
+  const endToken = `\\end{${env}}`;
+  const endIndex = content.indexOf(endToken, cursor);
+  if (endIndex < 0) return null;
+  return { body: content.slice(cursor, endIndex), start: begin.index, end: endIndex + endToken.length };
+}
+
+/** Free text after the tabular (e.g. "Notes: ..." or a tablenotes environment). */
+function extractTableNotes(content: string, tabular: { end: number } | null): string | undefined {
+  const tail = tabular ? content.slice(tabular.end) : "";
+  const notesEnv = content.match(/\\begin\{tablenotes\}(?:\[[^\]]*\])?([\s\S]*?)\\end\{tablenotes\}/);
+  let raw = notesEnv ? notesEnv[1].replace(/\\item(?:\[[^\]]*\])?/g, " ") : tail;
+  raw = raw
+    .replace(/\\end\{(?:adjustbox|center|threeparttable|minipage)\}/g, " ")
+    .replace(/\\label\{[^}]*\}/g, " ")
+    .replace(/\\caption\*?\{[^}]*\}/g, " ")
+    .replace(/^\s*\}+/, " ");
+  const cleaned = cleanLatexInline(raw).replace(/^[\s}]+/, "").replace(/^Notes?\s*[:.]\s*/i, "").trim();
+  return cleaned.length > 2 ? cleaned : undefined;
+}
+
+/** Splits a tabular row on unescaped "&". */
+function splitTabularCells(row: string): string[] {
+  const cells: string[] = [];
+  let current = "";
+  let depth = 0;
+  for (let i = 0; i < row.length; i++) {
+    const ch = row[i];
+    if (ch === "\\" && i + 1 < row.length) { current += ch + row[i + 1]; i++; continue; }
+    if (ch === "{") depth++;
+    if (ch === "}") depth = Math.max(0, depth - 1);
+    if (ch === "&" && depth === 0) { cells.push(current); current = ""; continue; }
+    current += ch;
+  }
+  cells.push(current);
+  return cells;
+}
+
+/** Splits tabular content into rows on "\\" outside braces. */
+function splitTabularRows(content: string): string[] {
+  const rows: string[] = [];
+  let current = "";
+  let depth = 0;
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i];
+    if (ch === "\\" && content[i + 1] === "\\" && depth === 0) {
+      rows.push(current);
+      current = "";
+      i++;
+      // skip optional spacing argument such as \\[2pt]
+      const rest = content.slice(i + 1);
+      const spacing = rest.match(/^\s*\[[^\]]*\]/);
+      if (spacing) i += spacing[0].length;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < content.length) { current += ch + content[i + 1]; i++; continue; }
+    if (ch === "{") depth++;
+    if (ch === "}") depth = Math.max(0, depth - 1);
+    current += ch;
+  }
+  if (current.trim()) rows.push(current);
+  return rows;
+}
+
 function parseTabularContent(content: string): { headers: string[]; rows: string[][] } {
-  const rawRows = content.split("\\\\").map(r => r.trim()).filter(r => r.length > 0);
+  const rawRows = splitTabularRows(content);
   const headers: string[] = [];
   const rows: string[][] = [];
 
   for (let i = 0; i < rawRows.length; i++) {
     let row = rawRows[i];
-    // Remove rule commands
-    row = row.replace(/\\(?:hline|toprule|midrule|bottomrule)\s*/g, "").trim();
-    row = row.replace(/\\cline\{[^}]*\}\s*/g, "").trim();
+    // Remove rule and spacing commands
+    row = row.replace(/\\(?:hline|toprule|midrule|bottomrule|addlinespace|endhead|endfirsthead|endfoot|endlastfoot)(?:\[[^\]]*\])?\s*/g, "");
+    row = row.replace(/\\(?:cline|cmidrule)(?:\([^)]*\))?\{[^}]*\}\s*/g, "");
+    row = row.replace(/\\rowcolor(?:\[[^\]]*\])?\{[^}]*\}\s*/g, "");
+    row = row.trim();
     if (!row) continue;
 
-    const cells = row.split("&").map(c => {
-      let cell = cleanLatexInline(c.trim());
+    const cells: string[] = [];
+    for (const rawCell of splitTabularCells(row)) {
+      const multi = rawCell.trim().match(/^\\multicolumn\{(\d+)\}\{[^}]*\}\{([\s\S]*)\}$/);
+      const span = multi ? Math.max(1, Number(multi[1])) : 1;
+      let cell = cleanLatexInline((multi ? multi[2] : rawCell).trim());
       // Format very large/small numbers to scientific notation to prevent overflow
       cell = cell.replace(/(-?\d+\.\d{4,}(?:e[+-]?\d+)?)/gi, (match) => {
         const n = parseFloat(match);
@@ -634,15 +716,18 @@ function parseTabularContent(content: string): { headers: string[]; rows: string
         }
         return match;
       });
-      return cell;
-    });
+      cells.push(cell);
+      for (let k = 1; k < span; k++) cells.push("");
+    }
     if (headers.length === 0) {
       headers.push(...cells);
     } else {
       rows.push(cells);
     }
   }
-  return { headers, rows };
+  const width = Math.max(headers.length, ...rows.map(r => r.length), 0);
+  while (headers.length < width) headers.push("");
+  return { headers, rows: rows.map(r => (r.length < width ? [...r, ...Array(width - r.length).fill("")] : r)) };
 }
 
 /* ------------------------------------------------------------------ */
@@ -984,6 +1069,9 @@ function cleanLatexInline(text: string): string {
   // Math: inline $...$ → convert to Unicode math
   result = result.replace(/\$([^$]+)\$/g, (_m, math) => latexMathToUnicode(math));
 
+  // Unescaped ~ is a LaTeX non-breaking space (Table~1)
+  result = result.replace(/(?<!\\)~/g, " ");
+
   // Escaped special characters
   result = result.replace(/\\\$/g, "$");
   result = result.replace(/\\%/g, "%");
@@ -1062,8 +1150,47 @@ function parseMarkdownToSections(
     currentParagraph = "";
   }
 
-  for (const line of lines) {
+  let pendingTableCaption: string | undefined;
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const line = lines[lineIndex];
     const trimmed = line.trim();
+
+    // "**Table 2.** Title" line introducing a Markdown table
+    const tableTitle = trimmed.match(/^\*\*(Table\s+\d+)\.?\*\*\s*(.*)$/i);
+    if (tableTitle && lines.slice(lineIndex + 1, lineIndex + 4).some(l => l.trim().startsWith("|"))) {
+      flushParagraph();
+      pendingTableCaption = `${tableTitle[1]}: ${tableTitle[2]}`;
+      continue;
+    }
+    if (trimmed.startsWith("|") && trimmed.endsWith("|")) {
+      flushParagraph();
+      const block: string[] = [];
+      while (lineIndex < lines.length && lines[lineIndex].trim().startsWith("|")) {
+        block.push(lines[lineIndex].trim());
+        lineIndex++;
+      }
+      lineIndex--;
+      const parseRow = (row: string) => row.replace(/^\||\|$/g, "").split(/(?<!\\)\|/).map(cell => cell.replace(/\\\|/g, "|").trim());
+      const dataRows = block.filter(row => !/^\|?\s*:?-{2,}/.test(row.replace(/^\|/, "").trim()));
+      if (dataRows.length > 0) {
+        let notes: string | undefined;
+        const next = lines[lineIndex + 1]?.trim() === "" ? lines[lineIndex + 2]?.trim() : lines[lineIndex + 1]?.trim();
+        if (next && /^\*Notes?:\*/i.test(next)) notes = next.replace(/^\*Notes?:\*\s*/i, "");
+        sections.push({
+          type: "table",
+          headers: parseRow(dataRows[0]),
+          rows: dataRows.slice(1).map(parseRow),
+          tableCaption: pendingTableCaption,
+          notes,
+        });
+      }
+      pendingTableCaption = undefined;
+      continue;
+    }
+    if (/^\*Notes?:\*/i.test(trimmed)) {
+      // already attached to the preceding table
+      continue;
+    }
 
     if (trimmed.startsWith("# ")) {
       flushParagraph();
@@ -1135,13 +1262,14 @@ function parseMarkdownToSections(
 const PAGE_WIDTH = 595.28;
 const PAGE_HEIGHT = 841.89;
 const MARGIN_TOP = 72;
-const MARGIN_BOTTOM = 72;
+const MARGIN_BOTTOM = 84;
 const MARGIN_LEFT = 56;
 const MARGIN_RIGHT = 56;
 const CONTENT_WIDTH = PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
-// Keep footer text safely within printable area to avoid implicit page creation.
-const PAGE_NUMBER_Y = PAGE_HEIGHT - 92;
-const FOOTER_NOTE_Y = PAGE_HEIGHT - 82;
+// Footers sit below the text block; the bottom margin is lifted while drawing them so
+// PDFKit never creates an implicit page, and body text can no longer run into them.
+const PAGE_NUMBER_Y = PAGE_HEIGHT - 52;
+const FOOTER_NOTE_Y = PAGE_HEIGHT - 40;
 
 async function renderSectionsToPdf(
   sections: PaperSection[],
@@ -1185,6 +1313,135 @@ async function renderSectionsToPdf(
         if (needed > available && doc.y > MARGIN_TOP + 20) {
           doc.addPage();
         }
+      };
+
+      const isNumericCell = (text: string) => /^[\s([]*[-+]?(\d[\d,]*\.?\d*(e[-+]?\d+)?|\.\d+)%?\**[)\]]*\s*$/i.test(text.trim()) || /^\[[-+\d.,e\s]+\]$/i.test(text.trim());
+
+      /**
+       * Booktabs-style table with column widths measured from the content. Long cells wrap
+       * inside their column instead of being truncated, numeric columns are right-aligned,
+       * the font shrinks for wide tables, and the header repeats after page breaks.
+       */
+      const renderTable = (section: PaperSection) => {
+        const headers = (section.headers || []).map(h => sanitizeForPdf(h));
+        const rows = (section.rows || []).map(row => headers.map((_, i) => sanitizeForPdf(row[i] || "")));
+        const columnCount = headers.length;
+        if (columnCount === 0) return;
+        const cellPadX = 4;
+        const cellPadY = 2.5;
+        const numericColumn = headers.map((_, col) => {
+          const values = rows.map(r => r[col]).filter(v => v.trim() !== "");
+          return col > 0 && values.length > 0 && values.filter(isNumericCell).length / values.length >= 0.6;
+        });
+
+        const measure = (fontSize: number) => {
+          const natural: number[] = [];
+          const minimum: number[] = [];
+          for (let col = 0; col < columnCount; col++) {
+            doc.font(FONT_SERIF_BOLD).fontSize(fontSize);
+            let widest = doc.widthOfString(headers[col] || " ");
+            let longestWord = Math.max(...(headers[col] || " ").split(/\s+/).map(w => doc.widthOfString(w || " ")));
+            doc.font(FONT_SERIF).fontSize(fontSize);
+            for (const row of rows) {
+              const text = row[col] || "";
+              widest = Math.max(widest, doc.widthOfString(text));
+              longestWord = Math.max(longestWord, ...text.split(/\s+/).map(w => doc.widthOfString(w || " ")));
+            }
+            natural.push(widest + cellPadX * 2);
+            minimum.push(Math.min(widest, Math.max(longestWord, 24)) + cellPadX * 2);
+          }
+          return { natural, minimum };
+        };
+
+        let fontSize = columnCount <= 4 ? 9 : columnCount <= 6 ? 8.5 : columnCount <= 9 ? 7.5 : 6.5;
+        let { natural, minimum } = measure(fontSize);
+        while (natural.reduce((a, b) => a + b, 0) > CONTENT_WIDTH && fontSize > 6.5) {
+          fontSize = Math.max(6.5, fontSize - 0.5);
+          ({ natural, minimum } = measure(fontSize));
+        }
+        let widths = natural.slice();
+        const totalNatural = natural.reduce((a, b) => a + b, 0);
+        if (totalNatural > CONTENT_WIDTH) {
+          // Give every column its minimum, then share the remaining width in proportion to
+          // how much each column would still like to grow.
+          const minTotal = minimum.reduce((a, b) => a + b, 0);
+          if (minTotal >= CONTENT_WIDTH) {
+            widths = minimum.map(w => (w / minTotal) * CONTENT_WIDTH);
+          } else {
+            const spare = CONTENT_WIDTH - minTotal;
+            const wants = natural.map((w, i) => Math.max(0, w - minimum[i]));
+            const wantTotal = wants.reduce((a, b) => a + b, 0) || 1;
+            widths = minimum.map((w, i) => w + (wants[i] / wantTotal) * spare);
+          }
+        }
+        const tableWidth = widths.reduce((a, b) => a + b, 0);
+        const tableX = MARGIN_LEFT + Math.max(0, (CONTENT_WIDTH - tableWidth) / 2);
+        const columnX = widths.map((_, i) => tableX + widths.slice(0, i).reduce((a, b) => a + b, 0));
+
+        const rowHeight = (cells: string[], bold: boolean) => {
+          doc.font(bold ? FONT_SERIF_BOLD : FONT_SERIF).fontSize(fontSize);
+          return Math.max(...cells.map((text, i) => doc.heightOfString(text || " ", { width: Math.max(8, widths[i] - cellPadX * 2), lineGap: 0.5 }))) + cellPadY * 2;
+        };
+        const drawRow = (cells: string[], y: number, bold: boolean) => {
+          doc.font(bold ? FONT_SERIF_BOLD : FONT_SERIF).fontSize(fontSize).fillColor("#000000");
+          cells.forEach((text, i) => {
+            doc.text(text, columnX[i] + cellPadX, y + cellPadY, {
+              width: Math.max(8, widths[i] - cellPadX * 2),
+              align: numericColumn[i] ? "right" : "left",
+              lineGap: 0.5,
+            });
+          });
+        };
+        const rule = (y: number, weight: number) => {
+          doc.moveTo(tableX, y).lineTo(tableX + tableWidth, y).strokeColor("#000000").lineWidth(weight).stroke();
+        };
+
+        const headerHeight = rowHeight(headers, true);
+        const firstRows = rows.slice(0, 3).reduce((sum, r) => sum + rowHeight(r, false), 0);
+        doc.moveDown(0.6);
+        ensureSpace(Math.min(headerHeight + firstRows + 40, PAGE_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM - 40));
+
+        if (section.tableCaption) {
+          doc.font(FONT_SERIF_BOLD).fontSize(9).fillColor("#000000");
+          const captionText = sanitizeForPdf(section.tableCaption);
+          const split = captionText.match(/^(Table\s+\d+:)\s*([\s\S]*)$/);
+          if (split) {
+            doc.text(`${split[1].replace(/:$/, ".")} `, MARGIN_LEFT, doc.y, { width: CONTENT_WIDTH, continued: true });
+            doc.font(FONT_SERIF).text(split[2]);
+          } else {
+            doc.text(captionText, MARGIN_LEFT, doc.y, { width: CONTENT_WIDTH });
+          }
+          doc.moveDown(0.3);
+        }
+
+        let y = doc.y;
+        rule(y, 0.9);
+        drawRow(headers, y, true);
+        y += headerHeight;
+        rule(y, 0.5);
+        for (const row of rows) {
+          const h = rowHeight(row, false);
+          if (y + h > PAGE_HEIGHT - MARGIN_BOTTOM - 6) {
+            rule(y, 0.9);
+            doc.addPage();
+            y = doc.y;
+            rule(y, 0.9);
+            drawRow(headers, y, true);
+            y += headerHeight;
+            rule(y, 0.5);
+          }
+          drawRow(row, y, false);
+          y += h;
+        }
+        rule(y, 0.9);
+        doc.y = y + 4;
+        if (section.notes) {
+          doc.font(FONT_SERIF_ITALIC).fontSize(Math.max(7, fontSize - 0.5)).fillColor("#333333");
+          doc.text(`Notes: ${sanitizeForPdf(section.notes)}`, tableX, doc.y, { width: Math.max(tableWidth, CONTENT_WIDTH * 0.6), align: "left", lineGap: 0.5 });
+          doc.fillColor("#000000");
+        }
+        doc.x = MARGIN_LEFT;
+        doc.moveDown(0.8);
       };
 
       // Process each section
@@ -1315,39 +1572,33 @@ async function renderSectionsToPdf(
                 const rawBuffer = await imageBufferCache.get(cacheKey)!;
                 const imgBuffer = rawBuffer ? await ensurePdfEmbeddableImage(rawBuffer) : null;
                 if (imgBuffer && imgBuffer.length > 500) {
-                  // Calculate image dimensions to fit within content width
-                  const maxImgWidth = CONTENT_WIDTH * 0.85;
-                  const maxImgHeight = 280;
-
-                  // Estimate actual rendered height for page-break calculation
-                  const captionHeight = section.caption ? 30 : 0;
-                  const totalFigureHeight = maxImgHeight + captionHeight + 40;
-                  ensureSpace(totalFigureHeight);
-
-                  doc.moveDown(0.8);
-                  const figStartY = doc.y;
-
-                  // Center the image
-                  const imgX = MARGIN_LEFT + (CONTENT_WIDTH - maxImgWidth) / 2;
-                  doc.image(imgBuffer, imgX, doc.y, {
-                    fit: [maxImgWidth, maxImgHeight],
-                    align: "center",
-                  });
-
-                  // PDFKit does not auto-advance y after image with fit; manually advance
+                  // Size the image from its real aspect ratio before deciding on a page break.
+                  const maxImgWidth = CONTENT_WIDTH * 0.92;
+                  const maxImgHeight = 330;
+                  let renderedWidth = maxImgWidth;
+                  let renderedHeight = maxImgWidth / 1.6;
                   try {
                     const sizeOf = (await import("image-size")).default;
                     const dims = sizeOf(imgBuffer);
                     if (dims.width && dims.height) {
                       const scale = Math.min(maxImgWidth / dims.width, maxImgHeight / dims.height);
-                      const renderedHeight = dims.height * scale;
-                      doc.y = figStartY + renderedHeight + 8;
-                    } else {
-                      doc.y = figStartY + maxImgHeight + 8;
+                      renderedWidth = dims.width * scale;
+                      renderedHeight = dims.height * scale;
                     }
                   } catch {
-                    doc.y = figStartY + maxImgHeight + 8;
+                    // keep default aspect ratio
                   }
+                  doc.font(FONT_SERIF).fontSize(9);
+                  const captionHeight = section.caption
+                    ? doc.heightOfString(sanitizeForPdf(section.caption), { width: CONTENT_WIDTH - 40 }) + 8
+                    : 0;
+                  ensureSpace(renderedHeight + captionHeight + 24);
+
+                  doc.moveDown(0.6);
+                  const figStartY = doc.y;
+                  const imgX = MARGIN_LEFT + (CONTENT_WIDTH - renderedWidth) / 2;
+                  doc.image(imgBuffer, imgX, figStartY, { width: renderedWidth, height: renderedHeight });
+                  doc.y = figStartY + renderedHeight + 6;
                   imageEmbedded = true;
                 } else {
                   console.warn(`[PDF] Image buffer too small or invalid for ${section.caption || "figure"}`);
@@ -1375,11 +1626,23 @@ async function renderSectionsToPdf(
 
             if (section.caption) {
               ensureSpace(25);
-              doc.font(FONT_SERIF_ITALIC).fontSize(9);
-              doc.text(sanitizeForPdf(section.caption), MARGIN_LEFT + 20, doc.y, {
-                width: CONTENT_WIDTH - 40,
-                align: "center",
-              });
+              const captionText = sanitizeForPdf(section.caption);
+              const split = captionText.match(/^(Figure\s+\d+:)\s*([\s\S]*)$/);
+              doc.fillColor("#000000");
+              if (split) {
+                doc.font(FONT_SERIF_BOLD).fontSize(9).text(`${split[1].replace(/:$/, ".")} `, MARGIN_LEFT + 20, doc.y, {
+                  width: CONTENT_WIDTH - 40,
+                  align: "justify",
+                  continued: true,
+                });
+                doc.font(FONT_SERIF).fontSize(9).text(split[2], { align: "justify" });
+              } else {
+                doc.font(FONT_SERIF_ITALIC).fontSize(9).text(captionText, MARGIN_LEFT + 20, doc.y, {
+                  width: CONTENT_WIDTH - 40,
+                  align: "center",
+                });
+              }
+              doc.x = MARGIN_LEFT;
               doc.moveDown(0.3);
             }
             // Add spacing after figure
@@ -1389,110 +1652,7 @@ async function renderSectionsToPdf(
 
           case "table": {
             if (!section.headers || section.headers.length === 0) break;
-
-            // Add spacing before table
-            doc.moveDown(0.6);
-
-            // Estimate total table height for page-break decision
-            const estRowHeight = (section.headers.length > 5 ? 7 : section.headers.length > 3 ? 8 : 9) + 6 + 2;
-            const estTableHeight = estRowHeight * ((section.rows?.length || 0) + 1) + 40; // rows + header + margins
-            ensureSpace(Math.min(estTableHeight, PAGE_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM - 40));
-
-            // Table caption
-            if (section.tableCaption) {
-              doc.font(FONT_SERIF_BOLD).fontSize(9);
-              doc.text(sanitizeForPdf(section.tableCaption), MARGIN_LEFT, doc.y, { width: CONTENT_WIDTH });
-              doc.moveDown(0.3);
-            }
-
-            const numCols = section.headers.length;
-            // Calculate column widths to fit within content width
-            const colWidth = Math.min(CONTENT_WIDTH / numCols, 120);
-            const tableWidth = colWidth * numCols;
-            const tableStartX = MARGIN_LEFT + Math.max(0, (CONTENT_WIDTH - tableWidth) / 2);
-            const cellPadding = 3;
-            const fontSize = numCols > 5 ? 7 : numCols > 3 ? 8 : 9;
-
-            // Draw header row
-            const headerY = doc.y;
-            doc.font(FONT_SERIF_BOLD).fontSize(fontSize);
-
-            // Header background
-            doc.rect(tableStartX, headerY - 2, tableWidth, fontSize + cellPadding * 2 + 2)
-              .fillOpacity(0.06).fill("#000000");
-            doc.fillOpacity(1).fillColor("#000000");
-
-            // Header text
-            for (let i = 0; i < numCols; i++) {
-              const cellX = tableStartX + i * colWidth + cellPadding;
-              doc.font(FONT_SERIF_BOLD).fontSize(fontSize);
-              doc.text(
-                sanitizeForPdf((section.headers[i] || "").substring(0, Math.floor(colWidth / (fontSize * 0.5)))),
-                cellX,
-                headerY + cellPadding,
-                { width: colWidth - cellPadding * 2, align: "left", lineBreak: false }
-              );
-            }
-
-            // Top rule
-            doc.moveTo(tableStartX, headerY - 2).lineTo(tableStartX + tableWidth, headerY - 2)
-              .strokeColor("#000000").lineWidth(1).stroke();
-
-            let currentY = headerY + fontSize + cellPadding * 2 + 2;
-
-            // Mid rule
-            doc.moveTo(tableStartX, currentY).lineTo(tableStartX + tableWidth, currentY)
-              .strokeColor("#000000").lineWidth(0.5).stroke();
-            currentY += 2;
-
-            // Data rows
-            doc.font(FONT_SERIF).fontSize(fontSize);
-            for (const row of (section.rows || [])) {
-              const rowHeight = fontSize + cellPadding * 2 + 2;
-              if (currentY + rowHeight > PAGE_HEIGHT - MARGIN_BOTTOM - 4) {
-                // Continue table on next page with repeated header
-                doc.addPage();
-                const continuedHeaderY = doc.y;
-                doc.rect(tableStartX, continuedHeaderY - 2, tableWidth, fontSize + cellPadding * 2 + 2)
-                  .fillOpacity(0.06).fill("#000000");
-                doc.fillOpacity(1).fillColor("#000000");
-                for (let i = 0; i < numCols; i++) {
-                  const cellX = tableStartX + i * colWidth + cellPadding;
-                  doc.font(FONT_SERIF_BOLD).fontSize(fontSize);
-                  doc.text(
-                    sanitizeForPdf((section.headers[i] || "").substring(0, Math.floor(colWidth / (fontSize * 0.5)))),
-                    cellX,
-                    continuedHeaderY + cellPadding,
-                    { width: colWidth - cellPadding * 2, align: "left", lineBreak: false }
-                  );
-                }
-                doc.moveTo(tableStartX, continuedHeaderY - 2).lineTo(tableStartX + tableWidth, continuedHeaderY - 2)
-                  .strokeColor("#000000").lineWidth(1).stroke();
-                currentY = continuedHeaderY + fontSize + cellPadding * 2 + 2;
-                doc.moveTo(tableStartX, currentY).lineTo(tableStartX + tableWidth, currentY)
-                  .strokeColor("#000000").lineWidth(0.5).stroke();
-                currentY += 2;
-                doc.font(FONT_SERIF).fontSize(fontSize);
-              }
-              for (let i = 0; i < numCols; i++) {
-                const cellX = tableStartX + i * colWidth + cellPadding;
-                const cellText = sanitizeForPdf((row[i] || "").substring(0, Math.floor(colWidth / (fontSize * 0.45))));
-                doc.text(cellText, cellX, currentY + cellPadding, {
-                  width: colWidth - cellPadding * 2,
-                  align: "left",
-                  lineBreak: false,
-                });
-              }
-              currentY += fontSize + cellPadding * 2;
-            }
-
-            // Bottom rule
-            doc.moveTo(tableStartX, currentY).lineTo(tableStartX + tableWidth, currentY)
-              .strokeColor("#000000").lineWidth(1).stroke();
-
-            doc.y = currentY + 8;
-            // Add spacing after table
-            doc.moveDown(0.8);
+            renderTable(section);
             break;
           }
 
@@ -1597,6 +1757,7 @@ async function renderSectionsToPdf(
       // Add page numbers and header to all pages
       for (let i = 0; i < totalPages; i++) {
         doc.switchToPage(i);
+        doc.page.margins.bottom = 0;
         // Footer: page number
         doc.font(FONT_SERIF).fontSize(8).fillColor("#999999");
         doc.text(
@@ -1619,6 +1780,7 @@ async function renderSectionsToPdf(
 
       // Footer on last page
       doc.switchToPage(totalPages - 1);
+      doc.page.margins.bottom = 0;
       doc.font(FONT_SERIF).fontSize(7).fillColor("#999999");
       doc.text(
         `Generated by Auto Research • ${new Date().toISOString().split("T")[0]}`,

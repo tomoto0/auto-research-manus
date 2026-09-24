@@ -12,7 +12,28 @@ import { storagePut, storageGet } from "./storage";
 import { notifyOwner } from "./_core/notification";
 import { nanoid } from "nanoid";
 import { generatePaperPdf, type ChartImage } from "./pdf-generator";
-import { executePythonExperiment, type DatasetInfo, type ExperimentOutput, type ExperimentProgressUpdate } from "./experiment-runner";
+import {
+  executePythonExperiment,
+  profileDatasetsForPlanning,
+  releasePlanningDownloads,
+  type DataProfileBundle,
+  type DatasetInfo,
+  type ExperimentOutput,
+  type ExperimentProgressUpdate,
+} from "./experiment-runner";
+import {
+  buildFigureManifest,
+  buildTableManifest,
+  describeAssetsForPrompt,
+  insertAssetsIntoLatex,
+  insertAssetsIntoMarkdown,
+  markersInText,
+  stripAssetMarkers,
+  tableToLatex,
+  tableToMarkdown,
+  type FigureManifestEntry,
+  type TableManifestEntry,
+} from "./paper-assets";
 import { isWorkerExecutionMode } from "./_core/pipeline-execution";
 
 async function notifyPipelineOwner(title: string, content: string): Promise<void> {
@@ -55,6 +76,33 @@ interface PipelineContext {
   executionDiagnostics: ExecutionDiagnostics | null;
   methodIntegrityNote: string;
   claimVerificationReport: string;
+  // Multi-step reasoning chain: each planning stage builds on the previous ones.
+  topicAnalysis: string;
+  searchQuery: string;
+  literatureSynthesis: string;
+  researchGaps: string;
+  dataProfile: DataProfileBundle | null;
+  analysisDesign: AnalysisDesign | null;
+  // Numbered paper assets derived from the executed analysis.
+  figureManifest: FigureManifestEntry[];
+  tableManifest: TableManifestEntry[];
+  figureNotes: string;
+  responseToReviewers: string;
+}
+
+/** Variable roles chosen for the empirical analysis (validated against the data). */
+interface AnalysisDesign {
+  outcome?: string;
+  keyExplanatory?: string;
+  treatment?: string;
+  entity?: string;
+  time?: string;
+  subgroup?: string;
+  controls: string[];
+  rationale: string;
+  researchQuestions: Array<{ question: string; test: string }>;
+  rejected: string[];
+  source: "llm" | "user" | "heuristic";
 }
 
 interface ResearchEvidenceProfile {
@@ -266,6 +314,25 @@ function buildDatasetDescription(datasets: DatasetInfo[]): string {
   }).join("\n");
 }
 
+/** Data dictionary for prompts: value-based profile when available, else upload metadata. */
+function buildDataContext(ctx: PipelineContext): string {
+  if (ctx.dataProfile?.text) return ctx.dataProfile.text;
+  return buildDatasetDescription(ctx.datasetFiles);
+}
+
+/** Truncates long stage outputs passed forward so prompts stay focused. */
+function clip(text: string | undefined | null, maxChars: number): string {
+  const value = (text || "").trim();
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}\n[... truncated ...]`;
+}
+
+/** Reads a single-line tag such as "SEARCH_QUERY: ..." from LLM output. */
+function extractTaggedLine(text: string, tag: string): string {
+  const match = text.match(new RegExp(`^\\s*\\**${tag}\\**\\s*:\\s*(.+)$`, "im"));
+  return match ? match[1].replace(/^["'`]+|["'`*]+$/g, "").trim() : "";
+}
+
 function buildDatasetCapabilityHints(datasets: DatasetInfo[]): string {
   if (datasets.length === 0) return "";
   return datasets.map((ds, i) => {
@@ -445,20 +512,45 @@ function buildLiteratureMethodSignals(papers: LiteratureResult[]): Record<string
   return signals;
 }
 
-function buildResearchEvidenceProfile(topic: string, datasets: DatasetInfo[], papers: LiteratureResult[]): ResearchEvidenceProfile {
+function buildResearchEvidenceProfile(
+  topic: string,
+  datasets: DatasetInfo[],
+  papers: LiteratureResult[],
+  dataProfile?: DataProfileBundle | null,
+  analysisInputs?: AnalysisInputs,
+): ResearchEvidenceProfile {
   const allCols = datasets.flatMap(ds => ds.columnNames || []).map(c => c.toLowerCase());
-  const hasTimeLike = allCols.some(c => /(year|month|date|time|wave|period|quarter)/i.test(c));
-  const hasTextLike = allCols.some(c => /(text|comment|abstract|title|description|review|note|content)/i.test(c));
+  let hasTimeLike = allCols.some(c => /(year|month|date|time|wave|period|quarter)/i.test(c));
+  let hasTextLike = allCols.some(c => /(text|comment|abstract|title|description|review|note|content)/i.test(c));
   const hasGraphLike = allCols.some(c => /(node|edge|source|target|network|graph)/i.test(c));
   const hasImageLike = allCols.some(c => /(image|img|pixel|vision|frame|video|path)/i.test(c));
-  const hasPanelLike = hasTimeLike && allCols.some(c => /(id|code|entity|respondent|household|firm|user|patient)/i.test(c));
-  const hasGroupLike = allCols.some(c => /(group|category|class|type|segment|gender|sex|region|prefecture|country|state|city|occupation|industry|cohort)/i.test(c));
-  const hasTreatmentLike = allCols.some(c => /(treat|treatment|intervention|policy|program|exposure|assignment)/i.test(c));
-  const hasOutcomeLike = allCols.some(c => /(outcome|target|response|score|rate|risk|income|wage|price|cost|value|metric|performance)/i.test(c));
-  const hasInstrumentLike = allCols.some(c => /(instrument|iv|encouragement|eligib|distance|shiftshare|shock|assignment)/i.test(c));
+  let hasPanelLike = hasTimeLike && allCols.some(c => /(id|code|entity|respondent|household|firm|user|patient)/i.test(c));
+  let hasGroupLike = allCols.some(c => /(group|category|class|type|segment|gender|sex|region|prefecture|country|state|city|occupation|industry|cohort)/i.test(c));
+  let hasTreatmentLike = allCols.some(c => /(treat|treatment|intervention|policy|program|exposure|assignment)/i.test(c));
+  let hasOutcomeLike = allCols.some(c => /(outcome|target|response|score|rate|risk|income|wage|price|cost|value|metric|performance)/i.test(c));
+  const hasInstrumentLike = allCols.some(c => /(instrument|(^|[^a-z])iv([^a-z]|$)|encouragement|eligib|distance|shiftshare|shock|assignment)/i.test(c));
   const hasRunningLike = allCols.some(c => /(running|forcing|cutoff|threshold|score|distance|margin|rank)/i.test(c));
-  const hasContinuousLike = allCols.some(c => /(score|rate|ratio|index|income|wage|price|cost|count|amount|duration|age|height|weight|value|metric|measure)/i.test(c));
-  const totalRowsHint = datasets.reduce((sum, ds) => sum + (ds.rowCount || 0), 0);
+  let hasContinuousLike = allCols.some(c => /(score|rate|ratio|index|income|wage|price|cost|count|amount|duration|age|height|weight|value|metric|measure)/i.test(c));
+  let totalRowsHint = datasets.reduce((sum, ds) => sum + (ds.rowCount || 0), 0);
+
+  // Value-based profile (actual types, time indices, repeated units) beats name matching:
+  // it recognises columns with uninformative or non-English names and avoids false panels.
+  if (dataProfile && dataProfile.datasets.length > 0) {
+    const profiles = dataProfile.datasets;
+    const columns = profiles.flatMap(p => p.columnProfiles);
+    hasTimeLike = profiles.some(p => p.timeColumns.length > 0);
+    hasPanelLike = profiles.some(p => !!p.panel);
+    hasTextLike = profiles.some(p => p.textColumns.length > 0);
+    hasGroupLike = hasGroupLike || columns.some(c => c.kind === "binary" || (c.kind === "categorical" && c.distinct >= 2 && c.distinct <= 20));
+    hasTreatmentLike = hasTreatmentLike || profiles.some(p => p.treatmentCandidates.length > 0);
+    hasOutcomeLike = hasOutcomeLike || columns.some(c => c.kind === "continuous" || c.kind === "discrete");
+    hasContinuousLike = hasContinuousLike || columns.some(c => c.kind === "continuous");
+    totalRowsHint = Math.max(totalRowsHint, profiles.reduce((sum, p) => sum + p.rows, 0));
+  }
+  if (analysisInputs?.treatment) hasTreatmentLike = true;
+  if (analysisInputs?.outcome) hasOutcomeLike = true;
+  if (analysisInputs?.time) hasTimeLike = true;
+  if (analysisInputs?.entity && analysisInputs?.time) hasPanelLike = true;
   const methodSignals = buildLiteratureMethodSignals(papers);
 
   const recommendedExecutableMethods = uniqMethodIds([
@@ -549,7 +641,7 @@ function buildMethodologyApplicabilityGuide(profile: ResearchEvidenceProfile): s
 
 function ensureEvidenceProfile(ctx: PipelineContext): ResearchEvidenceProfile {
   if (!ctx.evidenceProfile) {
-    ctx.evidenceProfile = buildResearchEvidenceProfile(ctx.topic, ctx.datasetFiles, ctx.papers);
+    ctx.evidenceProfile = buildResearchEvidenceProfile(ctx.topic, ctx.datasetFiles, ctx.papers, ctx.dataProfile, ctx.config.analysisInputs);
   }
   return ctx.evidenceProfile;
 }
@@ -777,8 +869,12 @@ function selectExecutionMethods(
   return selected;
 }
 
-function buildDeterministicAnalysisPlan(ctx: PipelineContext, contract: MethodFeasibilityContract): string {
-  const selectedMethods = selectExecutionMethods(contract, ctx.config.analysisInputs);
+function buildDeterministicAnalysisPlan(
+  ctx: PipelineContext,
+  contract: MethodFeasibilityContract,
+  analysisInputs: AnalysisInputs | undefined = ctx.config.analysisInputs,
+): string {
+  const selectedMethods = selectExecutionMethods(contract, analysisInputs);
   const analysisPlan = {
     version: 2,
     planType: "deterministic_dataset_analysis",
@@ -788,7 +884,15 @@ function buildDeterministicAnalysisPlan(ctx: PipelineContext, contract: MethodFe
       ...(contract.futureWorkOnly || []),
     ]),
     topic: ctx.topic,
-    analysisInputs: ctx.config.analysisInputs,
+    analysisInputs,
+    analysisDesign: ctx.analysisDesign
+      ? {
+          source: ctx.analysisDesign.source,
+          rationale: ctx.analysisDesign.rationale,
+          researchQuestions: ctx.analysisDesign.researchQuestions,
+          rejectedSuggestions: ctx.analysisDesign.rejected,
+        }
+      : undefined,
     datasetSummary: ctx.datasetFiles.map(d => ({
       name: d.originalName,
       rows: d.rowCount || 0,
@@ -797,6 +901,161 @@ function buildDeterministicAnalysisPlan(ctx: PipelineContext, contract: MethodFe
     note: "Execution plan intentionally capped to limit sandbox runtime and output volume.",
   };
   return JSON.stringify(analysisPlan, null, 2);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Analysis design: hypotheses -> variable roles                      */
+/* ------------------------------------------------------------------ */
+
+interface ProfiledColumn {
+  name: string;
+  kind: string;
+}
+
+function profiledColumns(ctx: PipelineContext): ProfiledColumn[] {
+  if (ctx.dataProfile?.datasets.length) {
+    return ctx.dataProfile.datasets.flatMap(d => d.columnProfiles.map(c => ({ name: c.name, kind: c.kind })));
+  }
+  return ctx.datasetFiles.flatMap(d => (d.columnNames || []).map(name => ({ name, kind: "unknown" })));
+}
+
+function matchColumn(columns: ProfiledColumn[], requested: unknown): ProfiledColumn | undefined {
+  if (typeof requested !== "string" || !requested.trim()) return undefined;
+  const value = requested.trim();
+  const norm = (text: string) => text.normalize("NFKC").toLowerCase().replace(/[\s_\-.,:;()[\]{}\/\\'"]+/g, "");
+  return columns.find(c => c.name === value)
+    || columns.find(c => c.name.toLowerCase() === value.toLowerCase())
+    || columns.find(c => norm(c.name) === norm(value));
+}
+
+/**
+ * Validates LLM-proposed variable roles against the actual columns and their value types.
+ * Invalid proposals are dropped (and reported) instead of being passed to the estimators.
+ */
+function validateAnalysisDesign(raw: Record<string, any>, columns: ProfiledColumn[]): AnalysisDesign {
+  const rejected: string[] = [];
+  const known = columns.some(c => c.kind !== "unknown");
+  const pick = (role: string, value: unknown, allowedKinds?: string[]): string | undefined => {
+    if (value === null || value === undefined || value === "" || value === "none") return undefined;
+    const column = matchColumn(columns, value);
+    if (!column) {
+      rejected.push(`${role}: "${String(value)}" is not a column in the data`);
+      return undefined;
+    }
+    if (known && allowedKinds && !allowedKinds.includes(column.kind)) {
+      rejected.push(`${role}: ${column.name} has type ${column.kind}, not suitable as ${role}`);
+      return undefined;
+    }
+    return column.name;
+  };
+  const outcome = pick("outcome", raw.outcome, ["continuous", "discrete", "binary"]);
+  let treatment = pick("treatment", raw.treatment, ["binary", "discrete", "continuous", "categorical"]);
+  let keyExplanatory = pick("key_explanatory", raw.key_explanatory ?? raw.keyExplanatory, ["continuous", "discrete", "binary", "categorical"]);
+  if (treatment && known && columns.find(c => c.name === treatment)?.kind !== "binary") {
+    // Non-binary "treatments" are analysed as the key explanatory variable.
+    keyExplanatory = keyExplanatory || treatment;
+    rejected.push(`treatment: ${treatment} is not a 0/1 indicator; used as key explanatory variable instead`);
+    treatment = undefined;
+  }
+  const entity = pick("entity", raw.entity, ["identifier", "categorical", "discrete", "continuous"]);
+  const time = pick("time", raw.time, ["datetime", "discrete", "continuous", "categorical"]);
+  const subgroup = pick("subgroup", raw.subgroup, ["categorical", "binary", "discrete"]);
+  const used = new Set([outcome, treatment, keyExplanatory, entity, time].filter(Boolean));
+  const controls = (Array.isArray(raw.controls) ? raw.controls : [])
+    .map((c: unknown) => pick("control", c, ["continuous", "discrete", "binary", "categorical"]))
+    .filter((c: string | undefined): c is string => !!c && !used.has(c))
+    .filter((c: string, i: number, all: string[]) => all.indexOf(c) === i)
+    .slice(0, 8);
+  const questions = (Array.isArray(raw.research_questions) ? raw.research_questions : [])
+    .map((q: any) => ({ question: String(q?.question || "").slice(0, 300), test: String(q?.test || "").slice(0, 300) }))
+    .filter((q: { question: string }) => q.question)
+    .slice(0, 5);
+  return {
+    outcome,
+    keyExplanatory: keyExplanatory !== outcome ? keyExplanatory : undefined,
+    treatment: treatment !== outcome ? treatment : undefined,
+    entity,
+    time,
+    subgroup,
+    controls,
+    rationale: String(raw.rationale || "").slice(0, 1500),
+    researchQuestions: questions,
+    rejected,
+    source: "llm",
+  };
+}
+
+function heuristicAnalysisDesign(ctx: PipelineContext): AnalysisDesign {
+  const roles = ctx.dataProfile?.datasets[0]?.suggestedRoles;
+  return {
+    outcome: roles?.outcome,
+    keyExplanatory: roles?.keyExplanatory,
+    treatment: roles?.treatment,
+    entity: roles?.entity,
+    time: roles?.time,
+    subgroup: roles?.group,
+    controls: roles?.controls || [],
+    rationale: "Heuristic variable roles derived from the data profile (the analysis-design step did not return a usable specification).",
+    researchQuestions: [],
+    rejected: [],
+    source: "heuristic",
+  };
+}
+
+/** User-specified roles always win; the design fills the gaps. */
+function mergeDesignIntoInputs(user: AnalysisInputs | undefined, design: AnalysisDesign | null): AnalysisInputs | undefined {
+  if (!design) return user;
+  const merged: AnalysisInputs = {
+    ...user,
+    outcome: user?.outcome || design.outcome,
+    treatment: user?.treatment || design.treatment,
+    keyExplanatory: user?.keyExplanatory || (user?.treatment ? undefined : design.keyExplanatory),
+    entity: user?.entity || design.entity,
+    time: user?.time || design.time,
+    subgroup: user?.subgroup || design.subgroup,
+    controls: user?.controls && user.controls.length > 0 ? user.controls : design.controls,
+  };
+  const defined = Object.fromEntries(Object.entries(merged).filter(([, v]) => v !== undefined && !(Array.isArray(v) && v.length === 0)));
+  return Object.keys(defined).length > 0 ? (defined as AnalysisInputs) : undefined;
+}
+
+async function designAnalysis(ctx: PipelineContext, contract: MethodFeasibilityContract): Promise<AnalysisDesign> {
+  const columns = profiledColumns(ctx);
+  const user = ctx.config.analysisInputs;
+  try {
+    const response = await callLLM(
+      "You are an applied quantitative methodologist. Translate the study's hypotheses into an estimable specification using ONLY columns that exist in the data dictionary. Prefer the variables that operationalise the hypotheses, choose pre-determined covariates as controls (never mediators or outcomes), and never pick identifiers as outcomes or controls.",
+      `Research topic: "${ctx.topic}"\n\nHypotheses and operationalisation (previous step):\n${clip(ctx.hypothesis, 5000)}\n\nMethodology (previous step):\n${clip(ctx.methodology, 4000)}\n\nExecutable methods: ${contract.executableNow.join(", ") || "descriptive statistics only"}\n\nData dictionary:\n${clip(buildDataContext(ctx), 8000)}${buildAnalysisInputContext(user)}\n\nReturn the specification as JSON between the tags below and nothing else inside the tags:\n[ANALYSIS_DESIGN_JSON]\n{"outcome": "<column>", "key_explanatory": "<column or null>", "treatment": "<0/1 indicator column or null>", "entity": "<repeated unit id column or null>", "time": "<time column or null>", "subgroup": "<categorical column for heterogeneity or null>", "controls": ["<column>", "..."], "rationale": "<3-6 sentences: why these roles, what the key coefficient means, main identification threat>", "research_questions": [{"question": "<RQ>", "test": "<which estimate/figure/table answers it>"}]}\n[/ANALYSIS_DESIGN_JSON]\n\nRules: use exact column names; "treatment" only for a genuine 0/1 intervention or exposure indicator; "entity" only if units are observed repeatedly; at most 8 controls; use null when a role does not apply.`,
+      4096,
+    );
+    const block = extractJsonBetweenTags(response, "ANALYSIS_DESIGN_JSON") || response.match(/\{[\s\S]*\}/)?.[0] || "";
+    const parsed = JSON.parse(block.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim());
+    const design = validateAnalysisDesign(parsed, columns);
+    if (!design.outcome && !user?.outcome) {
+      const fallback = heuristicAnalysisDesign(ctx);
+      return { ...fallback, rejected: design.rejected, rationale: `${fallback.rationale} ${design.rationale}`.trim() };
+    }
+    return design;
+  } catch (err: any) {
+    console.warn("[Pipeline] Analysis design step failed, using heuristic roles:", err?.message);
+    return heuristicAnalysisDesign(ctx);
+  }
+}
+
+function formatAnalysisDesign(design: AnalysisDesign | null, inputs: AnalysisInputs | undefined): string {
+  if (!design && !inputs) return "No analysis design available.";
+  const lines = [
+    `Outcome: ${inputs?.outcome || "not set"}`,
+    `Key explanatory variable: ${inputs?.treatment || inputs?.keyExplanatory || "not set"}`,
+    `Treatment indicator: ${inputs?.treatment || "none"}`,
+    `Unit identifier: ${inputs?.entity || "none"}; time: ${inputs?.time || "none"}`,
+    `Controls: ${inputs?.controls?.join(", ") || "none"}`,
+    `Subgroup for heterogeneity: ${inputs?.subgroup || "none"}`,
+  ];
+  if (design?.rationale) lines.push(`Rationale (${design.source}): ${design.rationale}`);
+  if (design?.researchQuestions.length) lines.push(`Research questions:\n${design.researchQuestions.map((q, i) => `  RQ${i + 1}. ${q.question} -> ${q.test}`).join("\n")}`);
+  if (design?.rejected.length) lines.push(`Rejected suggestions: ${design.rejected.join("; ")}`);
+  return lines.join("\n");
 }
 
 function extractRequestedExecutionMethods(experimentCode: string): string[] {
@@ -1218,22 +1477,72 @@ function buildEconometricWritingGuidance(ctx: PipelineContext): string {
 // ─── Stage Implementations ───
 
 async function stage1_topicAnalysis(ctx: PipelineContext): Promise<string> {
-  const datasetInfo = ctx.datasetFiles.length > 0
-    ? `\n\nThe researcher has uploaded the following dataset(s) for analysis:\n${buildDatasetDescription(ctx.datasetFiles)}\nIncorporate these datasets into the analysis plan.`
+  // Profile the uploaded data first so every planning stage reasons from actual column
+  // types, missingness and panel structure rather than from file names.
+  if (ctx.datasetFiles.length > 0 && !ctx.dataProfile) {
+    ctx.emit({ type: "log", runId: ctx.runId, stageNumber: 1, message: "Profiling uploaded datasets (types, missingness, panel structure)...", timestamp: Date.now() });
+    try {
+      ctx.dataProfile = await profileDatasetsForPlanning(ctx.runId, ctx.datasetFiles, ctx.topic, ctx.config.analysisInputs);
+      ctx.evidenceProfile = null;
+      await persistStageAudit(ctx, 1, {
+        dataProfile: ctx.dataProfile.datasets.map(d => ({ name: d.name, rows: d.rows, columns: d.columns, panel: d.panel, timeColumns: d.timeColumns, suggestedRoles: d.suggestedRoles })),
+      });
+    } catch (err: any) {
+      console.warn("[Pipeline] Data profiling failed; continuing with upload metadata:", err?.message);
+    }
+  }
+  const dataBlock = ctx.datasetFiles.length > 0
+    ? `\n\nThe researcher uploaded the following data. Treat it as the empirical basis of the study:\n${buildDataContext(ctx)}`
     : "";
-  return callLLM(
-    "You are a research topic analyst. Analyze the given research topic and extract key concepts, research questions, and relevant keywords for literature search.",
-    `Analyze this research topic in depth:\n\n"${ctx.topic}"${datasetInfo}\n\nProvide:\n1. Key research questions (3-5)\n2. Core concepts and definitions\n3. Related fields and subfields\n4. Search keywords for literature databases (10-15 keywords/phrases)\n5. Potential research directions`
+  const analysisInputContext = buildAnalysisInputContext(ctx.config.analysisInputs);
+  const result = await callLLM(
+    `You are a senior researcher scoping a study for ${ctx.config.targetConference === "General" ? "a leading peer-reviewed journal" : ctx.config.targetConference}. Reason step by step from the topic to questions that the available data can actually answer. Write in English even if the topic is given in another language.`,
+    `Research topic: "${ctx.topic}"${dataBlock}${analysisInputContext}
+
+Produce a structured scoping analysis:
+1. Restatement of the topic as a precise research problem (1 paragraph).
+2. Core constructs and how each could be measured${ctx.datasetFiles.length > 0 ? " - map each construct to specific columns of the uploaded data where possible, and flag constructs the data cannot measure" : ""}.
+3. Three to five research questions, ordered by importance${ctx.datasetFiles.length > 0 ? " and by how directly the uploaded data can answer them" : ""}.
+4. The unit of analysis, population and time frame implied by the data${ctx.datasetFiles.length > 0 ? " (cross-section, repeated cross-section or panel)" : ""}.
+5. Related fields and the theoretical perspectives most relevant to the questions.
+6. Ten to fifteen literature search keywords/phrases in English.
+7. Anticipated threats to validity (confounding, selection, measurement, reverse causality).
+
+Finish with exactly one line of the form:
+SEARCH_QUERY: <a concise English academic search query of 4-10 words capturing the core topic>`,
   );
+  ctx.topicAnalysis = result;
+  ctx.searchQuery = extractTaggedLine(result, "SEARCH_QUERY").slice(0, 200);
+  return result;
+}
+
+function literatureDedupKey(paper: LiteratureResult): string {
+  const doi = (paper.doi || "").trim().toLowerCase();
+  if (doi) return `doi:${doi}`;
+  return `title:${(paper.title || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()}`;
 }
 
 async function stage2_literatureSearch(ctx: PipelineContext): Promise<string> {
-  const searchResults = await unifiedSearch(ctx.topic, {
-    maxPerSource: 8,
+  // Search with the refined English query from stage 1 and with the original topic,
+  // then merge. Non-English topics otherwise retrieve little relevant literature.
+  const queries = Array.from(new Set([ctx.searchQuery, ctx.topic].map(q => (q || "").trim()).filter(Boolean)));
+  const resultSets = await Promise.all(queries.map((query, index) => unifiedSearch(query, {
+    maxPerSource: index === 0 ? 8 : 5,
     semanticScholarApiKey: process.env.SEMANTIC_SCHOLAR_API_KEY,
     springerApiKey: process.env.SPRINGER_API_KEY,
     sources: ctx.config.dataSources,
-  });
+  }).catch((err: any) => {
+    console.warn(`[Pipeline] Literature search failed for "${query}":`, err?.message);
+    return [] as LiteratureResult[];
+  })));
+  const merged = new Map<string, LiteratureResult>();
+  for (const set of resultSets) {
+    for (const paper of set) {
+      const key = literatureDedupKey(paper);
+      if (!merged.has(key)) merged.set(key, paper);
+    }
+  }
+  const searchResults = Array.from(merged.values());
   ctx.papers = searchResults;
 
   if (searchResults.length > 0) {
@@ -1258,18 +1567,17 @@ async function stage2_literatureSearch(ctx: PipelineContext): Promise<string> {
   for (const p of searchResults) {
     sourceCounts[p.source] = (sourceCounts[p.source] || 0) + 1;
   }
-  ctx.evidenceProfile = buildResearchEvidenceProfile(ctx.topic, ctx.datasetFiles, searchResults);
-  const queryTerms = ctx.topic
+  ctx.evidenceProfile = buildResearchEvidenceProfile(ctx.topic, ctx.datasetFiles, searchResults, ctx.dataProfile, ctx.config.analysisInputs);
+  const queryTerms = `${ctx.searchQuery} ${ctx.topic}`
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ")
     .split(/\s+/)
     .filter(t => t.length >= 3)
-    .slice(0, 10);
+    .slice(0, 12);
   const topPapers = searchResults.slice(0, 20);
   const matchCounts = topPapers.map((p) => {
     const text = `${p.title || ""} ${p.abstract || ""}`.toLowerCase();
-    const matched = queryTerms.filter((term) => text.includes(term)).length;
-    return matched;
+    return queryTerms.filter((term) => text.includes(term)).length;
   });
   const avgQueryTermCoverage = matchCounts.length
     ? matchCounts.reduce((sum, n) => sum + n, 0) / matchCounts.length
@@ -1285,6 +1593,7 @@ async function stage2_literatureSearch(ctx: PipelineContext): Promise<string> {
     : 0;
   await persistStageAudit(ctx, 2, {
     papersFound: searchResults.length,
+    queries,
     sourceCounts,
     evidenceProfile: ctx.evidenceProfile,
     retrievalQuality: {
@@ -1301,14 +1610,15 @@ async function stage2_literatureSearch(ctx: PipelineContext): Promise<string> {
     .map(([k, v]) => `${k}(${v})`)
     .join(", ");
 
-  return `Found ${searchResults.length} papers from ${Object.entries(ctx.config.dataSources).filter(([,v]) => v).map(([k]) => k).join(", ")}.\nSource distribution: ${Object.entries(sourceCounts).map(([k, v]) => `${k}:${v}`).join(", ") || "none"}.\nLiterature method signals: ${topSignals || "none"}.\nRetrieval quality: avg query-term coverage=${avgQueryTermCoverage.toFixed(2)}, abstracts present=${(withAbstractRatio * 100).toFixed(1)}%, DOI present=${(withDoiRatio * 100).toFixed(1)}%.\n\nTop papers:\n${searchResults.slice(0, 10).map((p, i) => `${i + 1}. [${p.source}] ${p.title} (${p.year}) - Citations: ${p.citationCount}`).join("\n")}`;
+  return `Found ${searchResults.length} papers from ${Object.entries(ctx.config.dataSources).filter(([,v]) => v).map(([k]) => k).join(", ")} using ${queries.length} quer${queries.length === 1 ? "y" : "ies"}: ${queries.map(q => `"${q}"`).join("; ")}.\nSource distribution: ${Object.entries(sourceCounts).map(([k, v]) => `${k}:${v}`).join(", ") || "none"}.\nLiterature method signals: ${topSignals || "none"}.\nRetrieval quality: avg query-term coverage=${avgQueryTermCoverage.toFixed(2)}, abstracts present=${(withAbstractRatio * 100).toFixed(1)}%, DOI present=${(withDoiRatio * 100).toFixed(1)}%.\n\nTop papers:\n${searchResults.slice(0, 10).map((p, i) => `${i + 1}. [${p.source}] ${p.title} (${p.year}) - Citations: ${p.citationCount}`).join("\n")}`;
 }
 
 async function stage3_paperScreening(ctx: PipelineContext): Promise<string> {
   const paperList = ctx.papers.slice(0, 30).map((p, i) => `${i + 1}. "${p.title}" (${p.year}) [${p.source}]\nAbstract: ${p.abstract?.substring(0, 300)}...`).join("\n\n");
+  const questions = clip(ctx.topicAnalysis, 2500);
   const screeningResult = await callLLM(
-    "You are a research paper screener. Evaluate papers for relevance to the research topic. Be strict — exclude papers that are clearly unrelated to the core topic.",
-    `Research topic: "${ctx.topic}"\n\nScreen these papers for relevance:\n\n${paperList}\n\nFor each paper, output a structured line in this EXACT format (one per paper):\nPAPER_<number>: INCLUDE|EXCLUDE, score=<1-10>, reason=<brief justification>\n\nExample:\nPAPER_1: INCLUDE, score=9, reason=Directly addresses UK data archiving practices\nPAPER_2: EXCLUDE, score=2, reason=About blood cell classification, unrelated to topic\n\nAfter all paper evaluations, provide a brief summary of the screening results.`
+    "You are a research paper screener. Evaluate papers for relevance to the research topic and research questions. Be strict — exclude papers that are clearly unrelated to the core topic, but keep methodologically relevant papers (e.g. papers using the same estimators or data types) when they inform the design.",
+    `Research topic: "${ctx.topic}"${questions ? `\n\nScoping analysis (research questions and constructs):\n${questions}` : ""}\n\nScreen these papers for relevance:\n\n${paperList}\n\nFor each paper, output a structured line in this EXACT format (one per paper):\nPAPER_<number>: INCLUDE|EXCLUDE, score=<1-10>, reason=<brief justification>\n\nExample:\nPAPER_1: INCLUDE, score=9, reason=Directly addresses UK data archiving practices\nPAPER_2: EXCLUDE, score=2, reason=About blood cell classification, unrelated to topic\n\nAfter all paper evaluations, provide a brief summary of the screening results.`
   );
 
   // Parse screening results and filter ctx.papers
@@ -1338,27 +1648,35 @@ async function stage3_paperScreening(ctx: PipelineContext): Promise<string> {
 }
 
 async function stage4_deepAnalysis(ctx: PipelineContext): Promise<string> {
-  const topPapers = ctx.papers.slice(0, 10).map((p, i) => `${i + 1}. "${p.title}"\nAuthors: ${p.authors}\nAbstract: ${p.abstract}`).join("\n\n");
-  return callLLM(
-    "You are a research analyst performing deep analysis of academic papers.",
-    `Research topic: "${ctx.topic}"\n\nPerform deep analysis of these key papers:\n\n${topPapers}\n\nProvide:\n1. Methodology comparison across papers\n2. Key findings synthesis\n3. Contradictions or debates in the field\n4. Common limitations\n5. Emerging trends`
+  // Numbering matches the reference list used in the paper ([n] = ctx.papers[n-1]).
+  const papers = ctx.papers.slice(0, 20).map((p, i) => `[${i + 1}] ${p.authors || "Unknown"} (${p.year || "n.d."}). "${p.title}"${p.venue ? `. ${p.venue}` : ""}\nAbstract: ${clip(p.abstract, 900) || "not available"}`).join("\n\n");
+  const dataBlock = ctx.datasetFiles.length > 0 ? `\n\nData available for the present study:\n${clip(buildDataContext(ctx), 5000)}` : "";
+  const result = await callLLM(
+    "You are a research analyst writing an evidence synthesis for a literature review. Use only information contained in the abstracts provided; never invent findings, samples or effect sizes. Cite papers with their bracketed numbers, e.g. [3] or [2, 5].",
+    `Research topic: "${ctx.topic}"\n\nScoping analysis from the previous step:\n${clip(ctx.topicAnalysis, 3000)}${dataBlock}\n\nPapers (numbered as they will be cited in the paper):\n\n${papers}\n\nWrite a structured synthesis:\n1. Thematic synthesis: group the papers into 3-5 themes; for each theme summarise what is known, citing [n].\n2. Methods and data used in prior work (designs, estimators, samples, measures), citing [n].\n3. Consistent findings versus contested or mixed findings, citing [n].\n4. Common limitations (measurement, identification, external validity), citing [n].\n5. What this literature implies for the present study: which measures, specifications and robustness checks the analysis of the uploaded data should include, and which prior results it can be compared with.`,
   );
+  ctx.literatureSynthesis = result;
+  return result;
 }
 
 async function stage5_gapIdentification(ctx: PipelineContext): Promise<string> {
-  return callLLM(
-    "You are a research gap analyst. Identify unexplored areas and opportunities.",
-    `Research topic: "${ctx.topic}"\n\nBased on the literature analysis, identify:\n1. Unexplored research gaps (3-5)\n2. Methodological gaps\n3. Data/empirical gaps\n4. Theoretical gaps\n5. Prioritized gap ranking with justification\n6. Potential impact of addressing each gap`
+  const dataBlock = ctx.datasetFiles.length > 0 ? `\n\nData available for the present study:\n${clip(buildDataContext(ctx), 5000)}` : "";
+  const result = await callLLM(
+    "You are a research gap analyst. Identify gaps that are grounded in the literature synthesis and prioritise those the available data can credibly address. Cite papers with their bracketed numbers.",
+    `Research topic: "${ctx.topic}"\n\nScoping analysis:\n${clip(ctx.topicAnalysis, 2500)}\n\nLiterature synthesis (previous step):\n${clip(ctx.literatureSynthesis, 7000)}${dataBlock}\n\nIdentify:\n1. Empirical gaps (populations, settings, periods or outcomes not yet studied), citing the papers that define each gap.\n2. Methodological gaps (identification, measurement, heterogeneity, robustness).\n3. Theoretical gaps or unresolved debates.\n4. A ranked list of the 3 most promising gaps. For each: why it matters, which papers it builds on, whether the uploaded data can address it (name the columns), and what the data cannot resolve.\n5. The single gap this study will address and the contribution statement it implies (2-3 sentences).`,
   );
+  ctx.researchGaps = result;
+  return result;
 }
 
 async function stage6_hypothesisGeneration(ctx: PipelineContext): Promise<string> {
   const evidence = ensureEvidenceProfile(ctx);
   const analysisInputContext = buildAnalysisInputContext(ctx.config.analysisInputs);
+  const dataBlock = ctx.datasetFiles.length > 0 ? `\n\nData dictionary (actual column types and summaries):\n${clip(buildDataContext(ctx), 6000)}` : "";
   const hypothesisConstraint = `\n\nDataset/literature feasibility profile:\n- Dataset count: ${evidence.datasetSummary.datasetCount}\n- Capabilities: time=${evidence.datasetSummary.hasTimeLike ? "yes" : "no"}, text=${evidence.datasetSummary.hasTextLike ? "yes" : "no"}, panel=${evidence.datasetSummary.hasPanelLike ? "yes" : "no"}, graph=${evidence.datasetSummary.hasGraphLike ? "yes" : "no"}, image=${evidence.datasetSummary.hasImageLike ? "yes" : "no"}, group=${evidence.datasetSummary.hasGroupLike ? "yes" : "no"}, treatment=${evidence.datasetSummary.hasTreatmentLike ? "yes" : "no"}, outcome=${evidence.datasetSummary.hasOutcomeLike ? "yes" : "no"}\n- Executable method hints: ${evidence.recommendedExecutableMethods.join(", ") || "none"}\n- Constrained method hints: ${evidence.constrainedMethods.join(", ") || "none"}${analysisInputContext}\n\nMethodology applicability guide (derive hypotheses that can be empirically tested now):\n${buildMethodologyApplicabilityGuide(evidence)}`;
   const result = await callLLM(
-    "You are a research hypothesis generator. Create testable hypotheses from identified gaps.",
-    `Research topic: "${ctx.topic}"${hypothesisConstraint}\n\nBased on identified research gaps, generate:\n1. Primary hypothesis (clear, testable, specific)\n2. Secondary hypotheses (2-3)\n3. Null hypotheses\n4. Expected outcomes\n5. Variables (independent, dependent, control)\n6. Theoretical framework\n7. Operationalisation table (construct -> dataset column(s) -> expected sign/direction)\n8. Falsification criteria and rejection conditions for each core hypothesis\n\nRules:\n- Keep hypotheses executable with available data modalities.\n- If a hypothesis needs unavailable modalities, explicitly mark it as future-work only.`
+    "You are a research hypothesis generator. Derive testable hypotheses from the identified research gap, grounded in prior literature (cite [n]) and operationalised with the columns that actually exist in the data.",
+    `Research topic: "${ctx.topic}"\n\nSelected research gap and contribution (previous step):\n${clip(ctx.researchGaps, 5000)}${dataBlock}${hypothesisConstraint}\n\nGenerate:\n1. Primary hypothesis (clear, directional where theory allows, testable with the data)\n2. Secondary hypotheses (2-3), including at least one on heterogeneity across a subgroup that exists in the data if possible\n3. Null hypotheses\n4. Theoretical mechanism behind each hypothesis, citing prior work [n]\n5. Variables: outcome, key explanatory/treatment variable, controls, grouping variables - using exact column names from the data dictionary\n6. Operationalisation table (construct -> dataset column(s) -> expected sign/direction)\n7. Falsification criteria and rejection conditions for each core hypothesis\n8. Expected pattern in the figures and tables that would support or contradict each hypothesis\n\nRules:\n- Only use column names that appear in the data dictionary.\n- Keep hypotheses executable with available data modalities.\n- If a hypothesis needs unavailable data, explicitly mark it as future-work only.`
   );
   ctx.hypothesis = result;
   await persistStageAudit(ctx, 6, {
@@ -1373,8 +1691,10 @@ async function stage7_methodDesign(ctx: PipelineContext): Promise<string> {
   const hasDatasets = ctx.datasetFiles.length > 0;
   const analysisInputContext = buildAnalysisInputContext(ctx.config.analysisInputs);
   const datasetInfo = hasDatasets
-    ? `\n\nAvailable datasets for analysis:\n${buildDatasetDescription(ctx.datasetFiles)}`
+    ? `\n\nAvailable datasets for analysis (value-based data dictionary):\n${clip(buildDataContext(ctx), 7000)}`
     : "";
+  const gapBlock = ctx.researchGaps ? `\nResearch gap and intended contribution:\n${clip(ctx.researchGaps, 3000)}\n` : "";
+  const literatureMethods = ctx.literatureSynthesis ? `\nMethods used in prior work (from the literature synthesis):\n${clip(ctx.literatureSynthesis, 3000)}\n` : "";
   const capabilityHints = hasDatasets
     ? `\n\nDataset capability profile (derived from metadata; use this to avoid over-claiming):\n${buildDatasetCapabilityHints(ctx.datasetFiles)}`
     : "";
@@ -1410,7 +1730,7 @@ RULES:
 
   const result = await callLLM(
     `You are a research methodology designer. You must design methods that are REALISTIC and EXECUTABLE with the available data. Do NOT propose methods that sound impressive but cannot actually be implemented with the given dataset.`,
-    `Research topic: "${ctx.topic}"\nHypothesis: ${ctx.hypothesis}${datasetInfo}${capabilityHints}${evidenceHints}${analysisInputContext}${dataConstraint}\n\nDesign a complete experimental methodology:\n1. Research design (experimental/quasi-experimental/observational) — choose based on what the DATA actually supports\n2. Data description and variable operationalisation — map dataset columns to research variables\n3. Data preprocessing steps — handling missing values, encoding, normalisation\n4. Statistical analysis plan — specific tests/models matched to data type and research questions\n5. Evaluation approach — how will you assess the quality of the analysis?\n6. Baseline comparisons — what simple benchmarks will you compare against?\n7. Limitations — what CAN'T be answered with this data?\n8. Potential confounding variables and how to address them\n9. Hypothesis-to-test alignment matrix (hypothesis -> executable test -> decision rule -> expected falsification outcome)\n10. Methodology applicability matrix covering the major modern method families and readiness labels\n\nAt the end, add two sections:\n- "Executable Analyses" with concrete analyses runnable now.\n- "Blocked Analyses" with methods that require missing data/modalities and why.\n\nAlso add a final short section named "Empirical Readiness Classification" with one label:\n- empirical (if executable analyses can produce evidence-backed quantitative claims)\n- methodological_protocol (if evidence is mainly design/protocol and quantitative claims are not yet supported).`
+    `Research topic: "${ctx.topic}"\n${gapBlock}Hypothesis: ${ctx.hypothesis}${literatureMethods}${datasetInfo}${capabilityHints}${evidenceHints}${analysisInputContext}${dataConstraint}\n\nDesign a complete experimental methodology:\n1. Research design (experimental/quasi-experimental/observational) — choose based on what the DATA actually supports\n2. Data description and variable operationalisation — map dataset columns to research variables\n3. Data preprocessing steps — handling missing values, encoding, normalisation\n4. Statistical analysis plan — specific tests/models matched to data type and research questions\n5. Evaluation approach — how will you assess the quality of the analysis?\n6. Baseline comparisons — what simple benchmarks will you compare against?\n7. Limitations — what CAN'T be answered with this data?\n8. Potential confounding variables and how to address them\n9. Hypothesis-to-test alignment matrix (hypothesis -> executable test -> decision rule -> expected falsification outcome)\n10. Methodology applicability matrix covering the major modern method families and readiness labels\n\nAt the end, add two sections:\n- "Executable Analyses" with concrete analyses runnable now.\n- "Blocked Analyses" with methods that require missing data/modalities and why.\n\nAlso add a final short section named "Empirical Readiness Classification" with one label:\n- empirical (if executable analyses can produce evidence-backed quantitative claims)\n- methodological_protocol (if evidence is mainly design/protocol and quantitative claims are not yet supported).`
   );
   ctx.methodology = result;
   await persistStageAudit(ctx, 7, {
@@ -1424,7 +1744,7 @@ async function stage8_methodValidation(ctx: PipelineContext): Promise<string> {
   const evidence = ensureEvidenceProfile(ctx);
   const analysisInputContext = buildAnalysisInputContext(ctx.config.analysisInputs);
   const datasetInfo = ctx.datasetFiles.length > 0
-    ? `\n\nAvailable datasets:\n${buildDatasetDescription(ctx.datasetFiles)}`
+    ? `\n\nAvailable datasets (value-based data dictionary):\n${clip(buildDataContext(ctx), 7000)}`
     : "";
   const capabilityHints = ctx.datasetFiles.length > 0
     ? `\n\nDataset capability profile:\n${buildDatasetCapabilityHints(ctx.datasetFiles)}`
@@ -1451,15 +1771,21 @@ async function stage9_codeGeneration(ctx: PipelineContext): Promise<string> {
   ctx.methodContract = contract;
 
   if (hasDatasets) {
-    // The runner computes outputs from real data, so keep the persisted plan compact
+    // Reasoning step: map hypotheses to variable roles (validated against the data),
+    // then let the deterministic engine execute the plan. Keep the persisted plan compact
     // and cap execution to the highest-value feasible methods.
-    ctx.experimentCode = buildDeterministicAnalysisPlan(ctx, contract);
+    ctx.analysisDesign = await designAnalysis(ctx, contract);
+    const effectiveInputs = mergeDesignIntoInputs(ctx.config.analysisInputs, ctx.analysisDesign);
+    ctx.experimentCode = buildDeterministicAnalysisPlan(ctx, contract, effectiveInputs);
     await persistStageAudit(ctx, 9, {
       methodContract: contract,
+      analysisDesign: ctx.analysisDesign,
+      effectiveAnalysisInputs: effectiveInputs,
       selectedExecutionMethods: extractRequestedExecutionMethods(ctx.experimentCode),
       experimentCodeLength: ctx.experimentCode.length,
       deterministicPlan: true,
     });
+    ctx.emit({ type: "log", runId: ctx.runId, stageNumber: 9, message: `Analysis design:\n${formatAnalysisDesign(ctx.analysisDesign, effectiveInputs)}`, timestamp: Date.now() });
     return ctx.experimentCode;
   } else {
     // Original simulated code generation
@@ -1542,6 +1868,8 @@ async function stage11_experimentExecution(ctx: PipelineContext): Promise<string
       );
 
       ctx.experimentOutput = output;
+      ctx.figureManifest = buildFigureManifest(output);
+      ctx.tableManifest = buildTableManifest(output);
       const analyticalMetricEntries = getAnalyticalMetricEntries(output);
       ctx.executionDiagnostics = buildExecutionDiagnostics(
         ctx.methodContract,
@@ -1558,11 +1886,11 @@ async function stage11_experimentExecution(ctx: PipelineContext): Promise<string
       });
 
       // Build result summary
-      const chartSummary = output.charts.length > 0
-        ? `\n\nGenerated Charts:\n${output.charts.map((c, i) => `  ${i + 1}. ${c.name}: ${c.description}`).join("\n")}`
+      const chartSummary = ctx.figureManifest.length > 0
+        ? `\n\nGenerated Figures:\n${ctx.figureManifest.map(f => `  Figure ${f.number} (${f.name}, ${f.section}): ${f.caption}`).join("\n")}`
         : "";
-      const tableSummary = output.tables.length > 0
-        ? `\n\nGenerated Tables:\n${output.tables.map((t, i) => `  ${i + 1}. ${t.name}: ${t.description}`).join("\n")}`
+      const tableSummary = ctx.tableManifest.length > 0
+        ? `\n\nGenerated Tables:\n${ctx.tableManifest.map(t => `  Table ${t.number} (${t.name}, ${t.section}): ${t.title}`).join("\n")}`
         : "";
       const metricsSummary = Object.keys(output.metrics).length > 0
         ? `\n\nKey Metrics:\n${Object.entries(output.metrics).map(([k, v]) => `  ${k}: ${v}`).join("\n")}`
@@ -1590,6 +1918,7 @@ async function stage11_experimentExecution(ctx: PipelineContext): Promise<string
       return resultText;
     } catch (err: any) {
       console.warn("[Pipeline] Data analysis failed, using non-fabricated failure mode:", err?.message);
+      releasePlanningDownloads(ctx.runId);
       ctx.emit({
         type: "log", runId: ctx.runId, stageNumber: 11,
         message: `Data analysis failed: ${err?.message}. Proceeding without fabricated empirical results.`,
@@ -1662,28 +1991,43 @@ async function stage11_experimentExecution(ctx: PipelineContext): Promise<string
   return ctx.experimentResults;
 }
 
+/** Analytical metrics for prompts, without pipeline bookkeeping keys. */
+function curatedMetricLines(ctx: PipelineContext, max = 120): string {
+  return getAnalyticalMetricEntries(ctx.experimentOutput)
+    .filter(([key]) => !/^method_(readiness|status|applicability)_/.test(key))
+    .slice(0, max)
+    .map(([key, value]) => `${key}: ${value}`)
+    .join("\n");
+}
+
+function hasAssets(ctx: PipelineContext): boolean {
+  return ctx.figureManifest.length > 0 || ctx.tableManifest.length > 0;
+}
+
+function assetsBlock(ctx: PipelineContext, maxTableRows = 18): string {
+  return describeAssetsForPrompt(ctx.figureManifest, ctx.tableManifest, { maxTableRows });
+}
+
 async function stage12_resultCollection(ctx: PipelineContext): Promise<string> {
   const analyticalMetrics = getAnalyticalMetricEntries(ctx.experimentOutput);
   const hasRealData = analyticalMetrics.length > 0;
-  const experimentChartInfo = ctx.experimentOutput?.charts.length
-    ? `\n\nActual generated charts from data analysis:\n${ctx.experimentOutput.charts.map((c, i) => `${i + 1}. ${c.name}: ${c.description}`).join("\n")}`
-    : "";
+  const assets = hasAssets(ctx) ? `\n\nFigures and tables produced by the analysis engine (the ONLY valid source of numbers besides the metrics):\n${assetsBlock(ctx)}` : "";
   const experimentMetrics = hasRealData
-    ? `\n\nActual computed analytical metrics (these are the ONLY valid numerical results):\n${analyticalMetrics.map(([k, v]) => `${k}: ${v}`).join("\n")}`
-    : "";
-  const experimentTables = ctx.experimentOutput?.tables.length
-    ? `\n\nActual computed tables:\n${ctx.experimentOutput.tables.map((t, i) => `Table ${i + 1}: ${t.name}\n${t.data?.substring(0, 800)}`).join("\n\n")}`
+    ? `\n\nActual computed analytical metrics (these are the ONLY valid numerical results):\n${curatedMetricLines(ctx)}`
     : "";
   const contractBlock = `\n\nMethod feasibility contract:\n${formatMethodContract(ctx.methodContract)}`;
   const executionBlock = `\n\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}`;
+  const designBlock = ctx.analysisDesign ? `\n\nAnalysis design (variable roles):\n${formatAnalysisDesign(ctx.analysisDesign, ctx.config.analysisInputs)}` : "";
 
   const result = await callLLM(
-    `You are a data analyst organizing experimental results. CRITICAL ANTI-HALLUCINATION RULES:\n1. You may ONLY report numerical values that appear in the "Actual computed metrics" or "Actual computed tables" sections below.\n2. Do NOT invent, estimate, or extrapolate any numbers not explicitly provided.\n3. If no actual metrics are provided, state: "Empirical analysis could not be completed. No numerical results are available."\n4. Never write phrases like "results show" or "we found" followed by numbers you generated yourself.`,
-    `Organize these experiment results into structured format:\n\n${ctx.experimentResults}${experimentChartInfo}${experimentMetrics}${experimentTables}${contractBlock}${executionBlock}\n\nProvide:\n1. Summary of what data was actually analysed (based ONLY on the information above)\n2. List of actual computed metrics (copy them verbatim from above, do NOT add new ones)\n3. Description of generated charts and tables\n4. Data quality assessment\n5. Limitations of the analysis\n\n${!hasRealData ? "IMPORTANT: No empirical metrics were computed. State this clearly. Do NOT fabricate any numbers." : ""}`
+    `You are a data analyst organizing experimental results. CRITICAL ANTI-HALLUCINATION RULES:\n1. You may ONLY report numerical values that appear in the metrics, figure captions or tables below.\n2. Do NOT invent, estimate, or extrapolate any numbers not explicitly provided.\n3. If no actual metrics are provided, state: "Empirical analysis could not be completed. No numerical results are available."\n4. Never write phrases like "results show" or "we found" followed by numbers you generated yourself.`,
+    `Organize these experiment results into a structured results dossier:\n\n${clip(ctx.experimentResults, 6000)}${designBlock}${assets}${experimentMetrics}${contractBlock}${executionBlock}\n\nProvide:\n1. Analysed sample: datasets, observations, variables and any sample restrictions (based ONLY on the information above)\n2. For each table: what it reports and its key numbers (copied verbatim)\n3. For each figure: what it shows and the numbers stated in its caption\n4. Data quality assessment (missingness, outliers, sample size adequacy)\n5. Limitations of the analysis\n\n${!hasRealData ? "IMPORTANT: No empirical metrics were computed. State this clearly. Do NOT fabricate any numbers." : ""}`
   );
   await persistStageAudit(ctx, 12, {
     hasRealData,
     analyticalMetricCount: analyticalMetrics.length,
+    figureCount: ctx.figureManifest.length,
+    tableCount: ctx.tableManifest.length,
     methodContract: ctx.methodContract,
     executionDiagnostics: ctx.executionDiagnostics,
   });
@@ -1694,17 +2038,17 @@ async function stage13_statisticalAnalysis(ctx: PipelineContext): Promise<string
   const analyticalMetrics = getAnalyticalMetricEntries(ctx.experimentOutput);
   const hasRealMetrics = analyticalMetrics.length > 0;
   const experimentMetrics = hasRealMetrics
-    ? `\n\nActual computed analytical metrics from data analysis (ONLY these numbers are valid):\n${analyticalMetrics.map(([k, v]) => `${k}: ${v}`).join("\n")}`
+    ? `\n\nActual computed analytical metrics from data analysis (ONLY these numbers are valid):\n${curatedMetricLines(ctx)}`
     : "";
-  const experimentTables = ctx.experimentOutput?.tables.length
-    ? `\n\nActual computed tables from data analysis:\n${ctx.experimentOutput.tables.map((t, i) => `Table ${i + 1}: ${t.name}\n${t.data?.substring(0, 800)}`).join("\n\n")}`
-    : "";
+  const assets = hasAssets(ctx) ? `\n\nFigures and tables from the analysis engine:\n${assetsBlock(ctx, 24)}` : "";
   const contractBlock = `\n\nMethod feasibility contract:\n${formatMethodContract(ctx.methodContract)}`;
   const executionBlock = `\n\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}`;
+  const hypothesisBlock = ctx.hypothesis ? `\n\nHypotheses to evaluate:\n${clip(ctx.hypothesis, 3500)}` : "";
+  const designBlock = ctx.analysisDesign ? `\n\nAnalysis design:\n${formatAnalysisDesign(ctx.analysisDesign, ctx.config.analysisInputs)}` : "";
 
   const result = await callLLM(
-    `You are a statistician. CRITICAL ANTI-HALLUCINATION RULES:\n1. You may ONLY discuss and interpret numerical values that appear in the "Actual computed metrics" or "Actual computed tables" sections.\n2. Do NOT invent p-values, confidence intervals, effect sizes, or any other statistics not explicitly computed.\n3. If no actual metrics are provided, describe WHAT statistical tests SHOULD be performed and WHY, but do NOT report any numerical results.\n4. Clearly distinguish between "computed results" and "recommended analyses".`,
-    `${hasRealMetrics ? "Interpret and discuss" : "Describe the statistical analysis plan for"} these results:\n\n${ctx.experimentResults}${experimentMetrics}${experimentTables}${contractBlock}${executionBlock}\n\n${hasRealMetrics ? `Interpret the actual computed metrics above:\n1. What do these descriptive statistics tell us?\n2. What patterns or trends are visible?\n3. What additional statistical tests would strengthen the analysis?\n4. What are the limitations of the current analysis?\n5. Explicitly summarise methodology applicability using any method_readiness_* and method_status_* metrics, distinguishing executable_now vs partially_ready vs blocked methods.\n\nIMPORTANT: Only discuss the numbers provided above. Do NOT generate new statistics.` : `No empirical metrics were computed from the data. Describe:\n1. What statistical tests SHOULD be performed (but do NOT report results)\n2. What descriptive statistics would be informative\n3. Recommended hypothesis tests and their rationale\n4. Required assumptions and how to validate them\n5. Suggested sample size and power analysis approach\n6. A methodology applicability matrix (executable_now / partially_ready / blocked) with prerequisite checks\n\nIMPORTANT: Do NOT fabricate any numerical results. Only describe the analytical plan.`}`
+    `You are a statistician. CRITICAL ANTI-HALLUCINATION RULES:\n1. You may ONLY discuss and interpret numerical values that appear in the metrics, figure captions or tables provided.\n2. Do NOT invent p-values, confidence intervals, effect sizes, or any other statistics not explicitly computed.\n3. If no actual metrics are provided, describe WHAT statistical tests SHOULD be performed and WHY, but do NOT report any numerical results.\n4. Clearly distinguish between "computed results" and "recommended analyses".`,
+    `${hasRealMetrics ? "Interpret" : "Describe the statistical analysis plan for"} these results:\n\n${clip(ctx.experimentResults, 4000)}${designBlock}${hypothesisBlock}${assets}${experimentMetrics}${contractBlock}${executionBlock}\n\n${hasRealMetrics ? `Reason step by step:\n1. Descriptive picture: what the descriptive table and distribution figures say about the sample and the outcome.\n2. Main estimates: for the key explanatory variable, report the coefficient(s), standard errors or confidence intervals and significance exactly as given, and translate them into substantive terms (units of the outcome, share of a standard deviation).\n3. Robustness across specifications: compare estimates across models/estimators in the tables (bivariate vs adjusted, fixed effects, quantiles, causal designs) and explain differences.\n4. Diagnostics: what residual, balance, overlap, pre-trend or first-stage evidence implies for the credibility of the estimates.\n5. Hypothesis verdicts: for EACH hypothesis state supported / not supported / inconclusive, citing the specific table or figure and number.\n6. Statistical versus practical significance, and the main threats to validity.\n\nIMPORTANT: Only discuss the numbers provided above. Do NOT generate new statistics.` : `No empirical metrics were computed from the data. Describe:\n1. What statistical tests SHOULD be performed (but do NOT report results)\n2. What descriptive statistics would be informative\n3. Recommended hypothesis tests and their rationale\n4. Required assumptions and how to validate them\n5. Suggested sample size and power analysis approach\n\nIMPORTANT: Do NOT fabricate any numerical results. Only describe the analytical plan.`}`
   );
   ctx.statisticalAnalysis = result;
   await persistStageAudit(ctx, 13, {
@@ -1717,16 +2061,12 @@ async function stage13_statisticalAnalysis(ctx: PipelineContext): Promise<string
 }
 
 async function stage14_figureGeneration(ctx: PipelineContext): Promise<string> {
-  // If we have real charts from Python execution, reference them
-  if (ctx.experimentOutput?.charts.length) {
-    const chartList = ctx.experimentOutput.charts.map((c, i) =>
-      `Figure ${i + 1}: ${c.name} - ${c.description} (URL: ${c.url})`
-    ).join("\n");
-
+  if (ctx.figureManifest.length > 0) {
     const result = await callLLM(
-      "You are a scientific visualization expert. Describe the generated figures for inclusion in the paper.",
-      `The following figures were generated from actual data analysis:\n\n${chartList}\n\nBased on these results:\n${ctx.experimentResults?.substring(0, 3000)}\n\nFor each figure, provide:\n1. A detailed caption suitable for a research paper\n2. Description of what the figure shows\n3. Key observations from the visualization\n4. How it supports the research hypothesis\n5. Academic-quality checklist (axis labels and units, legend clarity, sample size context, and whether confidence/statistical uncertainty information is shown or unavailable)\n\nAlso suggest any additional figures that would strengthen the paper.`
+      "You are a scientific visualisation editor preparing figure commentary for a journal article. Ground every statement in the captions and tables provided; never invent numbers or patterns that are not stated.",
+      `The analysis engine produced these figures (captions already contain the sample sizes and test statistics):\n\n${ctx.figureManifest.map(f => `Figure ${f.number} [${f.section}] (${f.name}): ${f.caption}`).join("\n")}\n\nSupporting tables:\n${describeAssetsForPrompt([], ctx.tableManifest, { maxTableRows: 14 })}\n\nHypotheses:\n${clip(ctx.hypothesis, 2500)}\n\nFor each figure provide:\n1. The key observation in one or two sentences, using only numbers from the captions/tables.\n2. How it bears on the hypotheses (supports / contradicts / descriptive context).\n3. The paper section where it belongs (Data, Results, Robustness, Appendix) and the sentence that should introduce it.\n\nThen list which figures are essential for the main text and which are better suited to an appendix.`
     );
+    ctx.figureNotes = result;
     ctx.figures = [result];
     return result;
   }
@@ -1737,25 +2077,29 @@ async function stage14_figureGeneration(ctx: PipelineContext): Promise<string> {
 }
 
 async function stage15_tableGeneration(ctx: PipelineContext): Promise<string> {
-  const hasRealTables = ctx.experimentOutput?.tables && ctx.experimentOutput.tables.length > 0;
-  const experimentTables = hasRealTables
-    ? `\n\nActual computed tables from data analysis (use ONLY these values):\n${ctx.experimentOutput!.tables.map((t, i) => `Table ${i + 1}: ${t.name}\n${t.data?.substring(0, 1000)}`).join("\n\n")}`
-    : "";
   const analyticalMetrics = getAnalyticalMetricEntries(ctx.experimentOutput);
   const hasRealMetrics = analyticalMetrics.length > 0;
-  const experimentMetrics = hasRealMetrics
-    ? `\n\nActual computed analytical metrics:\n${analyticalMetrics.map(([k, v]) => `${k}: ${v}`).join("\n")}`
-    : "";
+  if (ctx.tableManifest.length > 0) {
+    // Tables are typeset directly from the analysis engine's structured output: no values
+    // pass through the LLM, so they cannot be altered and the LaTeX is always well-formed.
+    ctx.tables = ctx.tableManifest.map(tableToLatex);
+    await persistStageAudit(ctx, 15, {
+      hasRealTables: true,
+      deterministicTables: ctx.tableManifest.map(t => ({ number: t.number, name: t.name, rows: t.rows.length, columns: t.headers.length, section: t.section })),
+      hasRealMetrics,
+    });
+    return `Typeset ${ctx.tableManifest.length} publication tables directly from the executed analysis (values copied verbatim; booktabs layout with automatic width fitting).\n\n${ctx.tableManifest.map(tableToMarkdown).join("\n\n")}`;
+  }
+
   const contractBlock = `\n\nMethod feasibility contract:\n${formatMethodContract(ctx.methodContract)}`;
   const executionBlock = `\n\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}`;
-
   const result = await callLLM(
-    `You are a scientific table designer. Create publication-quality LaTeX tables.\n\nCRITICAL ANTI-HALLUCINATION RULES:\n1. Tables MUST contain ONLY values from the "Actual computed tables" or "Actual computed metrics" sections.\n2. Do NOT invent, estimate, or fabricate any numerical values.\n3. If no actual data is provided, create tables showing the STRUCTURE only (column headers, row labels) with "—" or "N/A" in data cells, and add a note explaining that empirical values are pending.\n4. Every number in every cell must be traceable to the provided data.`,
-    `${hasRealTables || hasRealMetrics ? "Format the following actual data into publication-quality LaTeX tables" : "Describe the table structures that WOULD be included in an empirical version of this paper"}:\n\n${ctx.experimentResults}\n${ctx.statisticalAnalysis?.substring(0, 2000)}${experimentTables}${experimentMetrics}${contractBlock}${executionBlock}\n\n${hasRealTables ? `Convert the actual computed tables above into LaTeX format using booktabs. Preserve ALL original values exactly as computed. Do NOT round, adjust, or add values.` : `No empirical data tables were computed. Do NOT generate LaTeX table environments with empty cells or placeholder dashes.\nInstead, provide a PROSE DESCRIPTION of what tables the empirical study would include:\n1. Describe the structure of the main results table (what columns, what rows, what metrics)\n2. Describe the structure of the descriptive statistics table\n3. Use paragraph form, NOT LaTeX table environments\nThis ensures the paper reads well without empty placeholder tables.`}\n\nIn all cases, include (using available data only):\n- A descriptive-statistics table (if any descriptive metrics exist)\n- A methodology applicability table that clearly marks executable_now / partially_ready / blocked methods\n- Brief table notes about assumptions, sample coverage, and interpretation boundaries\n\nTable formatting rules (for real data only):\n- Use \\resizebox{\\textwidth}{!}{...} for tables with 4+ columns\n- Use booktabs (\\toprule, \\midrule, \\bottomrule)\n- Do NOT use sisetup or S column type\n- Keep column headers SHORT (abbreviate if needed)`
+    `You are a scientific table designer.\n\nCRITICAL ANTI-HALLUCINATION RULES:\n1. No empirical tables were computed; do NOT invent, estimate, or fabricate any numerical values.\n2. Describe table structures in prose only.`,
+    `Describe the table structures that WOULD be included in an empirical version of this paper:\n\n${clip(ctx.experimentResults, 3000)}\n${clip(ctx.statisticalAnalysis, 2000)}${contractBlock}${executionBlock}\n\nNo empirical data tables were computed. Do NOT generate LaTeX table environments with empty cells or placeholder dashes.\nInstead, provide a PROSE DESCRIPTION of what tables the empirical study would include:\n1. Describe the structure of the main results table (what columns, what rows, what metrics)\n2. Describe the structure of the descriptive statistics table\n3. Use paragraph form, NOT LaTeX table environments\nThis ensures the paper reads well without empty placeholder tables.`
   );
-  ctx.tables = [result];
+  ctx.tables = [];
   await persistStageAudit(ctx, 15, {
-    hasRealTables: !!hasRealTables,
+    hasRealTables: false,
     hasRealMetrics,
     methodContract: ctx.methodContract,
     executionDiagnostics: ctx.executionDiagnostics,
@@ -1767,9 +2111,10 @@ async function stage16_outlineGeneration(ctx: PipelineContext): Promise<string> 
   const fieldCtx = buildFieldContext(ctx);
   const venueLabel = ctx.config.targetConference === "General" ? `a leading venue in ${inferResearchField(ctx)}` : ctx.config.targetConference;
   const econometricGuidance = buildEconometricWritingGuidance(ctx);
+  const assets = hasAssets(ctx) ? `\n\nAvailable figures and tables (numbered; every one must be placed):\n${assetsBlock(ctx, 6)}` : "";
   const result = await callLLM(
     `You are an academic paper outline generator. ${fieldCtx}`,
-    `Research topic: "${ctx.topic}"\nMethod contract:\n${formatMethodContract(ctx.methodContract)}\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}${econometricGuidance ? `\n\n${econometricGuidance}` : ""}\n\nGenerate a detailed paper outline suitable for ${venueLabel}:\n1. Title (compelling, specific)\n2. Abstract outline (key points)\n3. Introduction structure (motivation, contributions)\n4. Related Work / Literature Review organization\n5. Methodology section structure\n6. Experiments / Empirical Analysis section structure\n7. Results and Discussion\n8. Conclusion and Future Work\n9. Appendix items\n\nInclude explicit subsection placeholders for:\n- Construct operationalisation and falsification logic\n- Estimands, model equations, identifying assumptions, and diagnostics where applicable\n- Evidence-backed findings only\n- Execution limitations and unmet data prerequisites\n\nAdapt the section naming and structure to conventions in ${inferResearchField(ctx)}.`
+    `Research topic: "${ctx.topic}"\nResearch gap and contribution:\n${clip(ctx.researchGaps, 2500)}\n\nHypotheses:\n${clip(ctx.hypothesis, 2500)}\n\nStatistical interpretation (hypothesis verdicts):\n${clip(ctx.statisticalAnalysis, 3500)}${assets}\n\nMethod contract:\n${formatMethodContract(ctx.methodContract)}\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}${econometricGuidance ? `\n\n${econometricGuidance}` : ""}\n\nGenerate a detailed paper outline suitable for ${venueLabel}:\n1. Title (specific; it must describe what the evidence actually shows, not unexecuted methods)\n2. Abstract outline (problem, data, method, key quantitative findings, contribution)\n3. Introduction (motivation, gap, research questions, contributions as a numbered list)\n4. Related Work organised in 2-4 themes\n5. Data section (source, sample, variables, descriptive evidence)\n6. Methodology section (estimands, model equations, identification, inference)\n7. Results section organised by research question/hypothesis, with robustness and heterogeneity subsections\n8. Discussion (interpretation, comparison with prior work, limitations) and Conclusion\n\nFIGURE AND TABLE PLACEMENT PLAN: for every figure and table listed above, state the section/subsection where it is discussed and the one-sentence point it supports. Descriptive assets belong in the Data section, main estimates in Results, diagnostics in Results (robustness) or the Appendix.\n\nAdapt the section naming and structure to conventions in ${inferResearchField(ctx)}.`
   );
   ctx.outline = result;
   return result;
@@ -1779,8 +2124,9 @@ async function stage17_abstractWriting(ctx: PipelineContext): Promise<string> {
   const analyticalMetrics = getAnalyticalMetricEntries(ctx.experimentOutput);
   const hasRealMetrics = analyticalMetrics.length > 0;
   const metricsForAbstract = hasRealMetrics
-    ? `\n\nActual computed analytical metrics (you may cite ONLY these specific numbers):\n${analyticalMetrics.map(([k, v]) => `${k}: ${v}`).join("\n")}`
+    ? `\n\nActual computed analytical metrics (you may cite ONLY these specific numbers or numbers in the tables below):\n${curatedMetricLines(ctx, 80)}`
     : "";
+  const assets = ctx.tableManifest.length ? `\n\nResult tables:\n${describeAssetsForPrompt([], ctx.tableManifest.filter(t => t.section === "main" || t.section === "descriptive"), { maxTableRows: 14 })}` : "";
   const methodIntegrityBlock = ctx.methodIntegrityNote
     ? `\n\nMethod execution integrity note:\n${ctx.methodIntegrityNote}`
     : "";
@@ -1789,46 +2135,61 @@ async function stage17_abstractWriting(ctx: PipelineContext): Promise<string> {
   const econometricGuidance = buildEconometricWritingGuidance(ctx);
 
   const result = await callLLM(
-    `You are an expert academic writer. ${buildFieldContext(ctx)} Write a compelling abstract. Use British English spelling and academic tone.\n\nCRITICAL ANTI-HALLUCINATION RULES:\n1. You may ONLY cite specific numbers that appear in the "Actual computed analytical metrics" section below.\n2. If no actual analytical metrics are provided, write the abstract WITHOUT specific numerical claims. Use qualitative descriptions instead (e.g., "we analyse", "we propose", "our framework examines").\n3. Do NOT invent percentages, p-values, effect sizes, or any other statistics.\n4. If methodology mentions techniques not executed, frame them as planned/future work, never as completed evidence.\n\nMETHODOLOGY ALIGNMENT RULES:\n5. The abstract MUST NOT mention unexecuted methods as contributions or methods of this paper.\n6. Only describe the methods that were actually executed (see execution diagnostics below).\n7. Unexecuted methods may be mentioned ONLY in a single sentence about future directions at the end of the abstract.\n8. The abstract should accurately reflect what the paper delivers, not what it aspires to deliver.`,
-    `Research topic: "${ctx.topic}"\nOutline:\n${ctx.outline}\nStatistical analysis:\n${ctx.statisticalAnalysis?.substring(0, 2000)}${metricsForAbstract}${methodIntegrityBlock}${contractBlock}${executionBlock}${econometricGuidance ? `\n\n${econometricGuidance}` : ""}\n\nWrite a 150-250 word abstract that:\n1. States the problem clearly\n2. Describes the approach and methodology\n3. ${hasRealMetrics ? "Highlights key results using ONLY the actual computed analytical metrics above" : "Describes the analytical framework and expected contributions WITHOUT fabricating numerical results"}\n4. States the main contribution\n5. If econometric methods are central, summarises the identification logic and empirical design without overstating causal claims\n\n${!hasRealMetrics ? "IMPORTANT: No empirical analytical metrics are available. Write the abstract focusing on the research question, methodology, and analytical framework. Do NOT include any specific numbers, percentages, or statistical values." : ""}`
+    `You are an expert academic writer. ${buildFieldContext(ctx)} Write a compelling abstract. Use British English spelling and academic tone.\n\nCRITICAL ANTI-HALLUCINATION RULES:\n1. You may ONLY cite specific numbers that appear in the metrics or tables below.\n2. If no actual analytical metrics are provided, write the abstract WITHOUT specific numerical claims. Use qualitative descriptions instead (e.g., "we analyse", "we propose", "our framework examines").\n3. Do NOT invent percentages, p-values, effect sizes, or any other statistics.\n4. If methodology mentions techniques not executed, frame them as planned/future work, never as completed evidence.\n\nMETHODOLOGY ALIGNMENT RULES:\n5. The abstract MUST NOT mention unexecuted methods as contributions or methods of this paper.\n6. Only describe the methods that were actually executed (see execution diagnostics below).\n7. Unexecuted methods may be mentioned ONLY in a single sentence about future directions at the end of the abstract.\n8. The abstract should accurately reflect what the paper delivers, not what it aspires to deliver.\n9. Output only the abstract text (no heading, no markdown).`,
+    `Research topic: "${ctx.topic}"\nOutline:\n${clip(ctx.outline, 4000)}\nStatistical analysis:\n${clip(ctx.statisticalAnalysis, 3000)}${assets}${metricsForAbstract}${methodIntegrityBlock}${contractBlock}${executionBlock}${econometricGuidance ? `\n\n${econometricGuidance}` : ""}\n\nWrite a 150-250 word abstract that:\n1. States the problem and the gap clearly\n2. Describes the data (source type, sample size, unit and period) and the approach\n3. ${hasRealMetrics ? "Reports the two or three key results with their magnitudes and uncertainty using ONLY the numbers above" : "Describes the analytical framework and expected contributions WITHOUT fabricating numerical results"}\n4. States the main contribution and implication\n5. If econometric methods are central, summarises the identification logic without overstating causal claims\n\n${!hasRealMetrics ? "IMPORTANT: No empirical analytical metrics are available. Write the abstract focusing on the research question, methodology, and analytical framework. Do NOT include any specific numbers, percentages, or statistical values." : ""}`
   );
-  ctx.abstract = result;
+  ctx.abstract = result.replace(/^#+\s*abstract\s*\n+/i, "").trim();
   await persistStageAudit(ctx, 17, {
     hasRealMetrics,
     methodContract: ctx.methodContract,
     executionDiagnostics: ctx.executionDiagnostics,
   });
-  return result;
+  return ctx.abstract;
 }
 
-async function stage18_bodyWriting(ctx: PipelineContext): Promise<string> {
-  // Build numbered reference list with stable BibTeX keys (ref1, ref2, ...) for citation alignment.
-  // Stage 18 uses [1], [2] in Markdown body; Stage 20 converts these to \cite{ref1}, \cite{ref2} in LaTeX.
-  const numberedRefs = ctx.papers.slice(0, 20).map((p, i) => {
+function buildNumberedReferenceList(ctx: PipelineContext): string {
+  return ctx.papers.slice(0, 20).map((p, i) => {
     const authors = p.authors || "Unknown";
     const year = p.year || "n.d.";
     const venue = p.venue ? `, ${p.venue}` : "";
     return `[${i + 1}] (key: ref${i + 1}) ${authors}. "${p.title}". ${year}${venue}.`;
   }).join("\n");
+}
 
-  // Build data analysis results section for the prompt
-  let dataAnalysisSection = "";
-  if (ctx.experimentOutput) {
-    const chartRefs = ctx.experimentOutput.charts.map((c, i) =>
-      `Figure ${i + 1}: ${c.name} - ${c.description}`
-    ).join("\n");
-    const tableRefs = ctx.experimentOutput.tables.map((t, i) =>
-      `Table ${i + 1}: ${t.name} - ${t.description}`
-    ).join("\n");
-    const metricsText = getAnalyticalMetricEntries(ctx.experimentOutput)
-      .map(([k, v]) => `${k}: ${v}`).join("\n");
-
-    dataAnalysisSection = `\n\n## Data Analysis Results (from actual dataset analysis)\nCharts generated:\n${chartRefs}\n\nTables generated:\n${tableRefs}\n\nAnalytical metrics:\n${metricsText || "None"}\n\nMethod feasibility contract:\n${formatMethodContract(ctx.methodContract)}\n\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}\n\nMethod integrity note:\n${ctx.methodIntegrityNote || "No integrity note available."}\n\nIMPORTANT: Reference these actual figures and tables in the paper body. Use "Figure 1", "Table 1" etc. to refer to them. The results section should discuss these actual analysis outputs only.\n\nIf method applicability metrics are present (e.g., method_readiness_* / method_status_* / method_applicability_summary), explicitly discuss what is executable now versus only partially ready versus blocked.`;
+/** Deterministic reference section listing every cited paper. */
+function buildReferencesSection(ctx: PipelineContext, body: string): string {
+  const cited = new Set<number>();
+  for (const match of Array.from(body.matchAll(/\[(\d{1,2}(?:\s*[,–-]\s*\d{1,2})*)\]/g))) {
+    for (const part of match[1].split(/\s*,\s*/)) {
+      const range = part.split(/\s*[–-]\s*/).map(Number);
+      if (range.length === 2 && range[0] <= range[1] && range[1] - range[0] < 20) {
+        for (let n = range[0]; n <= range[1]; n++) cited.add(n);
+      } else if (Number.isFinite(range[0])) cited.add(range[0]);
+    }
   }
+  const papers = ctx.papers.slice(0, 20);
+  const lines = papers
+    .map((p, i) => ({ p, n: i + 1 }))
+    .filter(({ n }) => cited.has(n))
+    .map(({ p, n }) => `[${n}] ${p.authors || "Unknown"}. "${p.title}". ${p.year || "n.d."}${p.venue ? `, ${p.venue}` : ""}.`);
+  return lines.length ? `## References\n\n${lines.join("\n")}` : "";
+}
 
+/** Keeps only the sections a writing pass was asked for (models sometimes restate others). */
+function trimToSections(text: string, allowed: RegExp): string {
+  const cleaned = stripCodeBlockMarkers(text).replace(/^#\s+[^\n]*\n+/, "");
+  const parts = cleaned.split(/(?=^##\s)/m);
+  const kept = parts.filter(part => !/^##\s/.test(part) || allowed.test(part.split("\n")[0]));
+  return kept.join("").trim();
+}
+
+async function stage18_bodyWriting(ctx: PipelineContext): Promise<string> {
+  const numberedRefs = buildNumberedReferenceList(ctx);
+  const refCount = ctx.papers.slice(0, 20).length;
   const hasRealMetrics = getAnalyticalMetricEntries(ctx.experimentOutput).length > 0;
-  const hasRealCharts = ctx.experimentOutput?.charts && ctx.experimentOutput.charts.length > 0;
-  const hasRealTables = ctx.experimentOutput?.tables && ctx.experimentOutput.tables.length > 0;
+  const hasRealCharts = ctx.figureManifest.length > 0;
+  const hasRealTables = ctx.tableManifest.length > 0;
+  const empirical = hasRealMetrics || hasRealCharts || hasRealTables;
   const econometricGuidance = buildEconometricWritingGuidance(ctx);
 
   const executedMethodsList = ctx.executionDiagnostics?.executedMethods?.join(", ") || "none";
@@ -1837,64 +2198,86 @@ async function stage18_bodyWriting(ctx: PipelineContext): Promise<string> {
     ...(ctx.methodContract?.futureWorkOnly || []),
   ].join(", ") || "none";
 
-  let antiHallucinationRules = "";
-  if (hasRealMetrics || hasRealCharts || hasRealTables) {
-    antiHallucinationRules = `\n\nANTI-HALLUCINATION RULES:\n1. In the Results section, you may ONLY report numerical values from the "Data Analysis Results" section above.\n2. When discussing figures and tables, describe what they show based on the provided descriptions.\n3. Do NOT invent additional statistics, p-values, or effect sizes beyond what is provided.\n4. If you need to discuss implications, use hedged language ("suggests", "indicates", "is consistent with").\n5. Any methodology component not confirmed by the method integrity note must be framed as unexecuted/future work.\n6. If method applicability metrics are available, include a dedicated subsection that classifies method families into executable_now, partially_ready, and blocked, and tie this classification to prerequisites/limitations.\n7. Descriptive statistics and academic-quality visualisation discussion must be included whenever such outputs exist.\n\nMETHODOLOGY-RESULTS ALIGNMENT (CRITICAL):\n- Actually executed methods: ${executedMethodsList}\n- Blocked/unexecuted methods: ${blockedMethodsList}\n- The Methodology section MUST describe ONLY the analyses that were actually executed.\n- Methods listed as blocked/unexecuted MUST appear ONLY in a "Limitations and Future Work" subsection, clearly marked as "not yet implemented" or "planned for future work".\n- The paper title MUST NOT reference unexecuted methods as if they are the paper's contribution.\n- Do NOT describe any blocked or unexecuted method as something "we apply" or "we implement" — only as "future work".`;
-  } else {
-    antiHallucinationRules = `\n\nCRITICAL ANTI-HALLUCINATION RULES (NO DATASET MODE):\n1. No empirical results were computed from the data. The Results and Discussion section MUST be framed as a methodological discussion, NOT as a results presentation.\n2. Do NOT fabricate any numerical results, p-values, correlations, means, standard deviations, or effect sizes.\n3. Instead, describe the analytical FRAMEWORK: what analyses would be performed, what metrics would be computed, and what patterns would be examined.\n4. Use conditional language throughout: "would", "is expected to", "the analysis aims to".\n5. Do NOT include any tables with empty cells, placeholder dashes ("—"), or "N/A" values. Instead, describe what the tables WOULD contain in prose form.\n6. Do NOT include a "DATA ANALYSIS STATUS" line or "Research Classification" section — these are internal metadata.\n7. Do NOT include an "Execution Limitations" section — limitations should be discussed within the Discussion section naturally.\n\nPAPER FRAMING (CRITICAL):\n- This paper should be framed as a METHODOLOGICAL FRAMEWORK or RESEARCH PROTOCOL paper, not an empirical study.\n- The "Results and Discussion" section should discuss the EXPECTED OUTCOMES of the proposed framework, the interpretive logic, and methodological merits.\n- Blocked/unexecuted methods: ${blockedMethodsList}\n- Do NOT use past tense ("we found", "we demonstrated") for unexecuted analyses. Use future/conditional tense only.\n- The paper should be self-contained and valuable as a methodological contribution even without empirical data.`;
-  }
+  const antiHallucinationRules = empirical
+    ? `\n\nANTI-HALLUCINATION RULES:\n1. You may ONLY report numerical values that appear in the figure captions, tables or metrics provided. Copy them exactly.\n2. When discussing figures and tables, describe what they show based on the provided captions and table contents.\n3. Do NOT invent additional statistics, p-values, or effect sizes beyond what is provided.\n4. Use hedged language for implications ("suggests", "indicates", "is consistent with"); never describe associations as causal effects unless a causal design (DiD, event study, IV, RDD, weighting, synthetic control) produced them, and even then state the identifying assumption.\n5. Any methodology component not confirmed by the method integrity note must be framed as unexecuted/future work.\n\nMETHODOLOGY-RESULTS ALIGNMENT (CRITICAL):\n- Actually executed methods: ${executedMethodsList}\n- Blocked/unexecuted methods: ${blockedMethodsList}\n- The Methodology section MUST describe ONLY the analyses that were actually executed.\n- Blocked/unexecuted methods may appear ONLY as limitations or future work.\n- Do NOT describe any blocked or unexecuted method as something "we apply" or "we implement".`
+    : `\n\nCRITICAL ANTI-HALLUCINATION RULES (NO DATASET MODE):\n1. No empirical results were computed. Frame results as a methodological discussion, NOT as a results presentation.\n2. Do NOT fabricate any numerical results, p-values, correlations, means, standard deviations, or effect sizes.\n3. Describe the analytical FRAMEWORK: what analyses would be performed and how results would be interpreted.\n4. Use conditional language throughout: "would", "is expected to", "the analysis aims to".\n5. Do NOT include tables with empty cells or placeholders; describe intended tables in prose.\n6. Do NOT include a "DATA ANALYSIS STATUS" line, a "Research Classification" section, or an "Execution Limitations" section.\n- Blocked/unexecuted methods: ${blockedMethodsList}\n- Do NOT use past tense ("we found", "we demonstrated") for unexecuted analyses.`;
 
-  const firstPass = await callLLM(
-    `You are an expert academic writer. ${buildFieldContext(ctx)} Use British English spelling. You MUST cite the provided references throughout the paper body using numbered citations like [1], [2], [3], etc. Every claim derived from prior work must include a citation. The Related Work / Literature Review section must cite at least 8 references. The Introduction should cite at least 3-5 references to motivate the research.${antiHallucinationRules}
+  const system = `You are an expert academic writer producing one part of a journal manuscript. ${buildFieldContext(ctx)} Use British English spelling and formal academic prose (paragraphs, not bullet points). Cite prior work with numbered citations [1]-[${refCount}] from the reference list only; never invent references. Each subsection needs at least two substantive paragraphs.${antiHallucinationRules}`;
 
-WRITING QUALITY REQUIREMENTS:
-- Each section must be substantive (at least 3-4 paragraphs for major sections like Methodology, Results).
-- Avoid single-sentence subsections. Every subsection must have at least 2 paragraphs of detailed content.
-- Use formal academic prose, not bullet points, for the main body text.
-- Methodology must include: (a) formal problem definition with mathematical notation where appropriate, (b) clear estimands and model equations for executed econometric/causal methods, (c) identifying assumptions and inference specification where relevant, (d) detailed description of the analytical framework or model, (e) data preprocessing steps, (f) variable operationalisation.
-- Experiments must include: (a) dataset description (source, size, time period, key variables), (b) experimental setup and implementation details, (c) evaluation metrics with definitions, (d) baseline methods for comparison.
-- Results must include: (a) main findings with reference to specific tables and figures, (b) discussion of statistical uncertainty and design diagnostics where applicable, (c) comparison with baselines or prior work, (d) limitations and potential confounds.`,
-    `Write the complete paper body in Markdown format.\n\nTopic: "${ctx.topic}"\nAbstract: ${ctx.abstract}\nOutline: ${ctx.outline}\nHypothesis package: ${ctx.hypothesis}\nMethodology: ${ctx.methodology}\nResults: ${ctx.experimentResults?.substring(0, 3000)}\nStatistical Analysis: ${ctx.statisticalAnalysis?.substring(0, 2000)}${dataAnalysisSection}${econometricGuidance ? `\n\n## ${econometricGuidance}` : ""}\n\n## Available References (use these numbered citations in the text):\n${numberedRefs}\n\nWrite complete sections with the following MINIMUM requirements:\n\n1. **Introduction** (at least 4 paragraphs) — Motivate the research problem with real-world significance, cite relevant prior work using [1], [2] etc., identify the specific research gap, and clearly state contributions (as a numbered list at the end of the Introduction).\n\n2. **Related Work** (at least 3 subsections) — Thoroughly review the literature. Cite each referenced paper by its number [1]-[${ctx.papers.slice(0, 20).length}]. Group related works thematically into subsections (e.g., "2.1 Prior Work on X", "2.2 Approaches to Y", "2.3 Gap Analysis"). Each subsection must have at least 2 paragraphs.\n\n3. **Methodology** (at least 4 subsections) — This is a CRITICAL section that must be detailed:\n   3.1 **Problem Formulation and Estimands** — Formally define the research problem. Use mathematical notation where appropriate (e.g., define variables, objective functions, hypotheses, and estimands).\n   3.2 **Analytical Framework / Model Description** — Describe the proposed approach step by step. Include model equations, data preprocessing, feature engineering, or variable operationalisation. Explain WHY each methodological choice was made.\n   3.3 **Identification, Inference, and Diagnostics** — For econometric or causal methods, state identifying assumptions, uncertainty quantification, and the diagnostic/falsification logic. If a method is unexecuted, explicitly mark it as future work.\n   3.4 **Implementation Details** — Describe tools, libraries, parameters, and computational environment used.\n   3.5 **Operationalisation and Falsification Logic** — explicitly map each core hypothesis to operational variables, executable tests, and falsification criteria.\n\n4. **Experiments** (at least 3 subsections) —\n   4.1 **Dataset Description** — Source, collection method, time period, sample size, key variables with descriptive statistics.\n   4.2 **Experimental Setup** — ${hasRealMetrics ? "Describe the exact configuration, parameterisation, standard-error or uncertainty specification, and reproducibility measures." : "Describe the planned experimental configuration and reproducibility measures. Acknowledge that full empirical results are pending."}\n   4.3 **Evaluation Metrics and Diagnostic Quantities** — Define each metric mathematically (e.g., accuracy = TP+TN/N, RMSE = sqrt(1/n * sum(yi - y_hat_i)^2)). For econometric designs, define the estimands and diagnostic quantities in words and equations.\n   4.4 **Baselines / Comparison Designs** — Describe comparison methods and why they were chosen.\n\n5. **Results and Discussion** (at least 4 paragraphs) — ${hasRealMetrics ? "Present findings using ONLY the actual computed metrics. Structure as: (a) Main results with table/figure references, (b) Interpretation of coefficient intervals, design diagnostics, or specialised econometric plots where available, (c) Comparison with baselines or prior work, (d) Limitations and threats to validity." : "Describe the analytical framework and what the results WOULD show. Do NOT fabricate any numbers. Use conditional language. Discuss expected patterns, required diagnostics, potential limitations, and how results would be interpreted."}\n\n6. **Conclusion and Future Work** (at least 2 paragraphs) — Summarise contributions (matching the numbered list from Introduction), discuss broader implications, and outline concrete future research directions.\n\n7. **Research Classification** — Add one explicit label and one short justification:\n   - empirical (if supported by executed evidence), or\n   - methodological_protocol (if empirical evidence is incomplete).\n\n8. **References** — List all cited references in the format:\n   [1] Authors. "Title". Year, Venue.\n   [2] Authors. "Title". Year, Venue.\n   ... (include ALL references from the list above that were cited in the text)\n\nIMPORTANT: You MUST include inline citations [1], [2], etc. throughout the text. The References section at the end MUST list every cited paper. Each major section must be substantive — no single-sentence sections or subsections.`,
-    32768
+  const assetRules = hasAssets(ctx)
+    ? `\n\nFIGURES AND TABLES: the typesetting system inserts them. Refer to them in the text as "Figure n" / "Table n" (numbers as listed). Immediately after the paragraph that first discusses an asset, put its placement marker alone on its own line, exactly as [[FIGURE:n]] or [[TABLE:n]]. Use each marker once. Never write your own Markdown tables or image links for these assets, and do not restate full tables in prose - discuss the key numbers.`
+    : "";
+  const commonContext = `Topic: "${ctx.topic}"\n\nAbstract:\n${ctx.abstract}\n\nOutline (including the figure/table placement plan):\n${clip(ctx.outline, 6000)}`;
+
+  // Pass 1: framing (Introduction + Related Work), grounded in the literature synthesis.
+  const introduction = await callLLM(
+    system,
+    `${commonContext}\n\nScoping analysis:\n${clip(ctx.topicAnalysis, 2500)}\n\nLiterature synthesis (cite with the same numbers):\n${clip(ctx.literatureSynthesis, 8000)}\n\nResearch gap and contribution:\n${clip(ctx.researchGaps, 3000)}\n\nHypotheses:\n${clip(ctx.hypothesis, 2500)}\n\nKey results to foreshadow (verbatim numbers only):\n${clip(ctx.statisticalAnalysis, 2500)}\n\nReference list:\n${numberedRefs}\n\nWrite ONLY these sections in Markdown:\n## 1. Introduction\n(at least 4 paragraphs: motivation with citations, what is known, the gap, the research questions, the approach and data in brief, the main findings in one paragraph, and a numbered list of 3-4 contributions)\n## 2. Related Work\n(2-4 thematic subsections ### 2.1 ..., citing at least 8 references overall and ending with how this study differs)`,
+    16384,
   );
+
+  // Pass 2: data and empirical strategy.
+  const dataAndMethods = await callLLM(
+    system,
+    `${commonContext}\n\nData dictionary:\n${clip(buildDataContext(ctx), 6000)}\n\nAnalysis design (variable roles):\n${formatAnalysisDesign(ctx.analysisDesign, ctx.config.analysisInputs)}\n\nMethodology (design stage; keep only executed parts):\n${clip(ctx.methodology, 5000)}\n\nMethod integrity note:\n${ctx.methodIntegrityNote || "n/a"}\n\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}${econometricGuidance ? `\n\n${econometricGuidance}` : ""}\n\n${hasAssets(ctx) ? `Figures and tables (descriptive and methods assets belong here):\n${assetsBlock(ctx, 12)}` : ""}\n\nReference list:\n${numberedRefs}${assetRules}\n\nWrite ONLY these sections in Markdown:\n## 3. Data\n(source and collection, unit of analysis, sample size and period, variable definitions and measurement (map constructs to variables), descriptive evidence citing the descriptive table/figures, missing data handling)\n## 4. Methodology\n(### 4.1 estimands and model equations in LaTeX math ($...$ / $$...$$) for every executed estimator, ### 4.2 identification and assumptions (be explicit about what is associational), ### 4.3 inference (standard errors, clustering, bootstrap), ### 4.4 robustness and diagnostics, ### 4.5 implementation)`,
+    16384,
+  );
+
+  // Pass 3: evidence (Results, Discussion, Conclusion).
+  const resultsAndDiscussion = await callLLM(
+    system,
+    `${commonContext}\n\nHypotheses:\n${clip(ctx.hypothesis, 3000)}\n\nStatistical interpretation and hypothesis verdicts:\n${clip(ctx.statisticalAnalysis, 6000)}\n\nFigure commentary:\n${clip(ctx.figureNotes, 4000)}\n\n${hasAssets(ctx) ? `All figures and tables (the ONLY source of numbers):\n${assetsBlock(ctx, 30)}` : `Results status:\n${clip(ctx.experimentResults, 3000)}`}\n\nKey metrics:\n${curatedMetricLines(ctx, 80) || "none"}\n\nLiterature synthesis for comparison with prior findings:\n${clip(ctx.literatureSynthesis, 3000)}\n\nIntroduction already written (keep contributions consistent):\n${clip(introduction, 3000)}\n\nReference list:\n${numberedRefs}${assetRules}\n\nWrite ONLY these sections in Markdown:\n## 5. Results\n(${empirical ? "organise by research question/hypothesis: ### 5.1 main estimates (magnitude, uncertainty, substantive meaning), ### 5.2 heterogeneity or group differences, ### 5.3 robustness and diagnostics; reference every main-text figure and table and state a verdict for each hypothesis" : "describe expected results and interpretation using conditional language"})\n## 6. Discussion\n(interpretation, mechanisms, comparison with prior studies [n], limitations and threats to validity, implications for policy/practice)\n## 7. Conclusion\n(2-3 paragraphs: summary of contributions matching the Introduction, and concrete future research)`,
+    16384,
+  );
+
+  const sections = [
+    trimToSections(introduction, /introduction|related|literature/i),
+    trimToSections(dataAndMethods, /data|method|empirical|strategy|design/i),
+    trimToSections(resultsAndDiscussion, /result|finding|discussion|conclusion|limitation/i),
+  ].filter(Boolean);
+  const draft = sections.join("\n\n");
+  const firstPass = `${draft}\n\n${buildReferencesSection(ctx, draft)}`.trim();
+
   const claimCheck = buildClaimVerificationReport(ctx, firstPass);
   ctx.claimVerificationReport = claimCheck.report;
   await persistStageAudit(ctx, 18, {
     claimVerificationReport: ctx.claimVerificationReport,
     flaggedClaimsCount: claimCheck.flaggedClaims.length,
+    markersUsed: markersInText(firstPass),
     methodContract: ctx.methodContract,
     executionDiagnostics: ctx.executionDiagnostics,
   });
 
+  const preserve = "Preserve the section structure, every [n] citation and every [[FIGURE:n]] / [[TABLE:n]] marker line exactly.";
   let result = firstPass;
   if (claimCheck.flaggedClaims.length > 0) {
     result = await callLLM(
-      `You are an expert academic editor. Rewrite the paper body to remove unsupported empirical/method claims while preserving quality and structure.`,
-      `Original body:\n${firstPass}\n\nClaim verifier report:\n${ctx.claimVerificationReport}\n\nMethod feasibility contract:\n${formatMethodContract(ctx.methodContract)}\n\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}\n\nRewrite requirements:\n1. Remove or reframe all flagged unsupported claims.\n2. Any method in requires_missing_data/future_work_only MUST be written as planned/future work only.\n3. Keep only evidence-backed empirical claims.\n4. Preserve section structure and citations.\n5. Do not add new quantitative values unless already in analytical metrics/tables.`
+      `You are an expert academic editor. Rewrite the paper body to remove unsupported empirical/method claims while preserving quality and structure. ${preserve}`,
+      `Original body:\n${firstPass}\n\nClaim verifier report:\n${ctx.claimVerificationReport}\n\nMethod feasibility contract:\n${formatMethodContract(ctx.methodContract)}\n\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}\n\nRewrite requirements:\n1. Remove or reframe all flagged unsupported claims.\n2. Any method in requires_missing_data/future_work_only MUST be written as planned/future work only.\n3. Keep only evidence-backed empirical claims.\n4. ${preserve}\n5. Do not add new quantitative values unless already in the provided figures, tables or metrics.\n6. Return the full body.`,
+      32768,
     );
   }
   const secondCheck = buildClaimVerificationReport(ctx, result);
   if (secondCheck.flaggedClaims.length > 0) {
     result = await callLLM(
-      `You are an academic compliance editor. Perform a strict final pass to eliminate unsupported claims.`,
-      `Draft body:\n${result}\n\nSecond-pass claim verifier report:\n${secondCheck.report}\n\nMethod feasibility contract:\n${formatMethodContract(ctx.methodContract)}\n\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}\n\nApply strict edits:\n1. Remove unsupported assertive claims.\n2. Replace unsupported completed-method wording with "planned/future work" wording.\n3. Preserve section structure and citation markers.\n4. Keep only evidence-backed numbers and references to actually generated figures/tables.`
+      `You are an academic compliance editor. Perform a strict final pass to eliminate unsupported claims. ${preserve}`,
+      `Draft body:\n${result}\n\nSecond-pass claim verifier report:\n${secondCheck.report}\n\nMethod feasibility contract:\n${formatMethodContract(ctx.methodContract)}\n\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}\n\nApply strict edits:\n1. Remove unsupported assertive claims.\n2. Replace unsupported completed-method wording with "planned/future work" wording.\n3. ${preserve}\n4. Keep only evidence-backed numbers and references to actually generated figures/tables.\n5. Return the full body.`,
+      32768,
     );
     ctx.claimVerificationReport = buildClaimVerificationReport(ctx, result).report;
   }
-  // Completeness check: ensure the paper has all required sections
-  const requiredSections = ["Introduction", "Related Work", "Methodology", "Experiment", "Result", "Conclusion"];
-  const missingSections = requiredSections.filter(sec => {
-    const pattern = new RegExp(`(?:^|\\n)#+\\s*\\d*\\.?\\s*${sec}`, "i");
-    return !pattern.test(result) && !result.toLowerCase().includes(sec.toLowerCase());
-  });
-
-  if (missingSections.length > 2) {
-    console.warn(`[Pipeline] Paper body missing ${missingSections.length} sections: ${missingSections.join(", ")}. The paper may be incomplete.`);
-    // Append a note about missing sections so downstream stages are aware
-    ctx.paperBody = result + `\n\n<!-- WARNING: The following sections may be incomplete or missing: ${missingSections.join(", ")} -->\n`;
-  } else {
-    ctx.paperBody = result;
+  result = stripCodeBlockMarkers(result);
+  if (!/^##\s*References/im.test(result)) {
+    result = `${result}\n\n${buildReferencesSection(ctx, result)}`.trim();
   }
+
+  // Completeness check: ensure the paper has all required sections
+  const requiredSections = ["Introduction", "Related Work", "Data|Method", "Result", "Conclusion"];
+  const missingSections = requiredSections.filter(sec => !new RegExp(`(?:^|\\n)#+\\s*\\d*\\.?\\s*(?:${sec})`, "i").test(result));
+  if (missingSections.length > 0) {
+    console.warn(`[Pipeline] Paper body missing sections: ${missingSections.join(", ")}. The paper may be incomplete.`);
+  }
+  ctx.paperBody = result;
   return result;
 }
 
@@ -1929,30 +2312,48 @@ function postProcessLatexSource(latex: string): string {
   return result;
 }
 
-async function stage20_latexCompilation(ctx: PipelineContext): Promise<string> {
-  // Build figure instructions if we have experiment-generated charts
-  let figureInstructions = "";
-  if (ctx.experimentOutput?.charts.length) {
-    const figureList = ctx.experimentOutput.charts.map((c, i) => {
-      const figKey = `figure_${i + 1}`;
-      return `  - Figure ${i + 1}: key="${figKey}", caption="${c.name}: ${c.description}"`;
-    }).join("\n");
+const REQUIRED_LATEX_PACKAGES = ["geometry", "amsmath", "amssymb", "graphicx", "float", "booktabs", "tabularx", "adjustbox", "hyperref"];
 
-    figureInstructions = `\n\n## IMPORTANT: Embed Data Analysis Figures\nThe following figures were generated from actual data analysis and MUST be embedded in the LaTeX document using \\includegraphics.\nFor each figure, use this exact pattern:\n\n\\begin{figure}[htbp]\n  \\centering\n  \\includegraphics[width=0.85\\textwidth]{<figure_key>}\n  \\caption{<caption text>}\n  \\label{fig:<label>}\n\\end{figure}\n\nAvailable figures:\n${figureList}\n\nPlace each figure in the most appropriate section (typically Results or Experiments). Use the exact figure key (e.g., figure_1, figure_2) as the argument to \\includegraphics. The graphicx package must be included in the preamble. Reference each figure in the text using \\ref{fig:<label>}.`;
+/** Adds any missing \usepackage lines needed by the deterministic figure/table markup. */
+function ensureLatexPackages(latex: string): string {
+  const missing = REQUIRED_LATEX_PACKAGES.filter(pkg => !new RegExp(`\\\\usepackage(?:\\[[^\\]]*\\])?\\{[^}]*\\b${pkg}\\b[^}]*\\}`).test(latex));
+  if (missing.length === 0) return latex;
+  const lines = missing.map(pkg => (pkg === "geometry" ? "\\usepackage[a4paper, margin=2.5cm]{geometry}" : `\\usepackage{${pkg}}`)).join("\n");
+  const docclass = latex.match(/\\documentclass(?:\[[^\]]*\])?\{[^}]*\}\s*\n?/);
+  if (docclass && docclass.index !== undefined) {
+    const at = docclass.index + docclass[0].length;
+    return `${latex.slice(0, at)}${lines}\n${latex.slice(at)}`;
   }
+  return `\\documentclass[11pt,a4paper]{article}\n${lines}\n${latex}`;
+}
+
+async function stage20_latexCompilation(ctx: PipelineContext): Promise<string> {
+  ctx.latex = await compileLatexDocument(ctx, ctx.paperBody || "", 20);
+  return ctx.latex;
+}
+
+/**
+ * Converts a Markdown paper body (with [[FIGURE:n]] / [[TABLE:n]] markers) into a complete
+ * LaTeX document. The LLM writes prose and equations; figures and tables are inserted
+ * deterministically afterwards. Reused by the revision stage.
+ */
+async function compileLatexDocument(ctx: PipelineContext, body: string, stageNumber: number): Promise<string> {
+  const figureInstructions = hasAssets(ctx)
+    ? `\n\n## FIGURES AND TABLES (CRITICAL)\nThe body contains placement markers such as [[FIGURE:2]] and [[TABLE:1]], each on its own line. Copy every marker unchanged onto its own line at the same position in the LaTeX output. Do NOT create \\begin{figure} or \\begin{table} environments for them and do NOT re-typeset any numeric results table: the typesetting system inserts ${ctx.figureManifest.length} figure(s) and ${ctx.tableManifest.length} table(s) at the markers. Refer to them in the text as Figure~\\ref{fig:figure_n} and Table~\\ref{tab:table_n} (e.g. Figure~\\ref{fig:figure_2}, Table~\\ref{tab:table_1}).`
+    : "";
 
   // Build a strict data manifest: only these numbers may appear in the paper
   const analyticalMetrics = getAnalyticalMetricEntries(ctx.experimentOutput);
   const hasRealMetrics = analyticalMetrics.length > 0;
-  const hasRealTables = ctx.experimentOutput?.tables && ctx.experimentOutput.tables.length > 0;
+  const hasRealTables = ctx.tableManifest.length > 0;
   let dataManifest = "";
   if (hasRealMetrics || hasRealTables) {
     dataManifest = `\n\n## ANTI-HALLUCINATION DATA MANIFEST\nThe following is the COMPLETE set of numerical results computed from the actual dataset.\nYou MUST use ONLY these values in the Results section. Do NOT invent, extrapolate, or add ANY numbers not listed here.\n`;
     if (hasRealMetrics) {
-      dataManifest += `\nComputed Analytical Metrics:\n${analyticalMetrics.map(([k, v]) => `  ${k} = ${v}`).join("\n")}\n`;
+      dataManifest += `\nComputed Analytical Metrics:\n${curatedMetricLines(ctx, 150).split("\n").map(line => `  ${line}`).join("\n")}\n`;
     }
-    if (hasRealTables) {
-      dataManifest += `\nComputed Tables (use these exact values in LaTeX tables):\n${ctx.experimentOutput!.tables.map((t, i) => `  Table ${i + 1}: ${t.name}\n${t.data?.substring(0, 1200)}`).join("\n\n")}\n`;
+    if (hasAssets(ctx)) {
+      dataManifest += `\nFigures and tables (inserted automatically at the markers; the numbers below are the only admissible values):\n${assetsBlock(ctx, 30)}\n`;
     }
     dataManifest += `\nMethod feasibility contract:\n${formatMethodContract(ctx.methodContract)}\n`;
     dataManifest += `\nExecution diagnostics:\n${formatExecutionDiagnostics(ctx.executionDiagnostics)}\n`;
@@ -1964,7 +2365,7 @@ async function stage20_latexCompilation(ctx: PipelineContext): Promise<string> {
     if (econometricGuidance) {
       dataManifest += `\n${econometricGuidance}\n`;
     }
-    dataManifest += `\nRULES:\n- Every number in the Results/Discussion sections MUST come from the list above.\n- If a statistic is not listed above, do NOT include it.\n- Do NOT add p-values, effect sizes, confidence intervals, or any other statistics unless they appear above.\n- Tables must reproduce the exact values from "Computed Tables" above.\n- If the data is insufficient, state the limitation rather than fabricating values.\n- Any method not explicitly supported by the method execution integrity note must be presented as planned/future work only.`;
+    dataManifest += `\nRULES:\n- Every number in the Results/Discussion sections MUST come from the list above.\n- If a statistic is not listed above, do NOT include it.\n- Do NOT add p-values, effect sizes, confidence intervals, or any other statistics unless they appear above.\n- If the data is insufficient, state the limitation rather than fabricating values.\n- Any method not explicitly supported by the method execution integrity note must be presented as planned/future work only.`;
   } else {
     dataManifest = `\n\n## ANTI-HALLUCINATION NOTICE (NO DATASET)\nNo empirical metrics were computed from the data. The LaTeX document MUST:\n- Frame the paper as a methodological framework/protocol, NOT as an empirical study\n- Describe the analytical framework without fabricating any numbers\n- Use conditional language ("would", "is expected to")\n- NOT contain any specific numerical results, p-values, correlations, means, or standard deviations\n- NOT include tables with empty/placeholder cells (dashes "---", "N/A", or blank cells). If table structures are needed, describe them in prose instead.\n- NOT include a "DATA ANALYSIS STATUS" text block or "Research Classification" section\n- NOT include an "Execution Limitations" section — discuss limitations naturally within the Discussion section`;
   }
@@ -1975,7 +2376,7 @@ async function stage20_latexCompilation(ctx: PipelineContext): Promise<string> {
 CRITICAL DOCUMENT CLASS RULE:
 - You MUST use \\documentclass[11pt,a4paper]{article} as the document class.
 - Do NOT use any conference-specific or journal-specific class files (e.g., neurips_2024, icml2025, elsarticle, apa7). These .cls files are NOT available and will cause compilation errors.
-- Instead, replicate the conference style using ONLY standard LaTeX packages (geometry, titling, amsmath, graphicx, booktabs, hyperref, tabularx, adjustbox, etc.).
+- Instead, replicate the conference style using ONLY standard LaTeX packages (geometry, amsmath, graphicx, booktabs, hyperref, tabularx, adjustbox, etc.).
 
 CRITICAL ANTI-HALLUCINATION RULE:
 - You MUST NOT invent, fabricate, or generate ANY numerical values (means, standard deviations, p-values, correlations, effect sizes, percentages, sample sizes) that are not explicitly provided in the data manifest below.
@@ -1986,15 +2387,12 @@ CRITICAL ANTI-HALLUCINATION RULE:
 CRITICAL REFERENCE INTEGRITY RULE:
 - You MUST ONLY cite references that appear in the BibTeX references provided below.
 - Do NOT invent, fabricate, or hallucinate ANY references, authors, titles, or publication years.
-- Do NOT add references with future publication years (e.g., 2026 or later).
-- Every \cite{key} command MUST have a corresponding \bibitem{key} in the bibliography.
-- Every \bibitem MUST correspond to a real paper from the provided BibTeX entries.
+- Every \\cite{key} command MUST have a corresponding \\bibitem{key} in the bibliography.
 - If you need more references than provided, state the limitation rather than fabricating citations.
 
 Output ONLY the raw LaTeX source code. Do NOT wrap it in markdown code blocks (no \`\`\`latex or \`\`\`). Start directly with \\documentclass and end with \\end{document}.
-You MUST include \\usepackage{graphicx}, \\usepackage{float}, \\usepackage{tabularx}, and \\usepackage{adjustbox} in the preamble.
-ALL content — including figures, tables, and equations — MUST fit within A4 portrait page margins (\\textwidth). Never allow any element to overflow the page width.`,
-    `Convert this paper to complete LaTeX format for a professional academic publication in ${inferResearchField(ctx)}:\n\nAbstract: ${ctx.abstract}\n\nBody (with numbered citations [1], [2], etc.):\n${ctx.paperBody || ""}\n\nTables:\n${ctx.tables.join("\n")}\n\nBibTeX references:\n${ctx.references || ""}${figureInstructions}${dataManifest}\n\nGenerate complete LaTeX source with:\n1. \\documentclass[11pt,a4paper]{article} — NEVER use conference-specific .cls files\n2. \\usepackage[a4paper, margin=2.5cm]{geometry} for A4 layout\n3. \\usepackage{graphicx}, \\usepackage{float}, \\usepackage{amsmath}, \\usepackage{amssymb}, \\usepackage{booktabs}, \\usepackage{hyperref}, \\usepackage{tabularx}, \\usepackage{adjustbox} in preamble\n4. Professional title formatting with \\title{}, \\author{}, \\date{}, \\maketitle\n5. All sections with proper \\cite{} commands for every reference\n6. Actual \\includegraphics commands for each data analysis figure (using the exact keys provided above)\n7. Table environments using booktabs (\\toprule, \\midrule, \\bottomrule)\n8. \\begin{thebibliography}{99} section at the end with all cited \\bibitem entries\n\n## TABLE WIDTH CONSTRAINTS (ABSOLUTELY CRITICAL — MUST FOLLOW):\nEvery table MUST fit within the A4 page width (\\textwidth = approximately 16cm with 2.5cm margins).\nFor tables with 4 or more columns, you MUST use one of these approaches:\n\nApproach 1 (PREFERRED): Wrap the entire tabular in \\resizebox:\n\\begin{table}[H]\n  \\centering\n  \\caption{...}\n  \\resizebox{\\textwidth}{!}{%\n    \\begin{tabular}{lcccc}\n      ...\n    \\end{tabular}%\n  }\n\\end{table}\n\nApproach 2: Use tabularx with X columns that auto-wrap:\n\\begin{table}[H]\n  \\centering\n  \\caption{...}\n  \\begin{tabularx}{\\textwidth}{lXXXX}\n    ...\n  \\end{tabularx}\n\\end{table}\n\nApproach 3: Use adjustbox:\n\\begin{table}[H]\n  \\centering\n  \\caption{...}\n  \\begin{adjustbox}{max width=\\textwidth}\n    \\begin{tabular}{lcccc}\n      ...\n    \\end{tabular}\n  \\end{adjustbox}\n\\end{table}\n\nRULES:\n- NEVER use plain \\begin{tabular} without \\resizebox, tabularx, or adjustbox for tables with 4+ columns\n- NEVER use sisetup or S column type (these cause width issues)\n- Use SHORT column headers (abbreviate long names, e.g., \"Female Mgmt Ratio\" instead of \"Female Management Ratio\")\n- Use \\footnotesize inside tables if needed for extra space\n- For correlation matrices and wide data tables, ALWAYS use \\resizebox{\\textwidth}{!}{...}\n\nA4 PAGE WIDTH CONSTRAINTS (OTHER ELEMENTS):\n- ALL figures MUST use width=\\textwidth or smaller (e.g., width=0.85\\textwidth) in \\includegraphics. Never use absolute widths.\n- ALL equations MUST fit within \\textwidth. For long equations, use split, multline, or aligned environments.\n- Never use \\hspace or manual spacing that pushes content beyond margins.\n\nIMPORTANT:\n- Convert all [1], [2] style citations to \\cite{key} commands with corresponding \\bibitem entries.\n- Output ONLY raw LaTeX code. Start with \\documentclass[11pt,a4paper]{article} and end with \\end{document}.\n- Each figure MUST use \\includegraphics with the exact key provided (e.g., figure_1, figure_2). Do NOT use placeholder paths or URLs.\n- Do NOT use \\usepackage{natbib} — use \\begin{thebibliography} with \\bibitem instead.\n- Do NOT use \\usepackage{siunitx} or S column type — they cause width overflow issues.`,
+ALL content — including equations and any conceptual tables you write — MUST fit within A4 portrait page margins (\\textwidth).`,
+    `Convert this paper to complete LaTeX format for a professional academic publication in ${inferResearchField(ctx)}:\n\nTitle (derive a concise, specific title from the abstract and body; do not name unexecuted methods): ${ctx.topic}\n\nAbstract: ${ctx.abstract}\n\nBody (Markdown with numbered citations [1], [2], ... and asset markers):\n${body}\n\nBibTeX references:\n${ctx.references || ""}${figureInstructions}${dataManifest}\n\nGenerate complete LaTeX source with:\n1. \\documentclass[11pt,a4paper]{article} — NEVER use conference-specific .cls files\n2. \\usepackage[a4paper, margin=2.5cm]{geometry}\n3. \\usepackage{graphicx}, \\usepackage{float}, \\usepackage{amsmath}, \\usepackage{amssymb}, \\usepackage{booktabs}, \\usepackage{hyperref}, \\usepackage{tabularx}, \\usepackage{adjustbox} in the preamble\n4. \\title{}, \\author{Auto Research}, \\date{\\today}, \\maketitle and an abstract environment\n5. Numbered \\section{} / \\subsection{} headings mirroring the Markdown headings (drop the manual numbers such as "3." from heading text)\n6. Markdown maths ($...$, $$...$$) as LaTeX inline maths and equation environments; long equations split with aligned/multline\n7. All [n] citations converted to \\cite{refN} (e.g. [3] -> \\cite{ref3}, [2, 5] -> \\cite{ref2,ref5})\n8. \\begin{thebibliography}{99} at the end with a \\bibitem{refN} for every cited reference (from the BibTeX entries)\n9. Every [[FIGURE:n]] / [[TABLE:n]] marker kept verbatim on its own line\n\nIMPORTANT:\n- Do NOT use \\usepackage{natbib} or \\usepackage{siunitx}; use thebibliography with \\bibitem.\n- For any small conceptual (non-numeric) table you add, use booktabs inside \\begin{adjustbox}{max width=\\textwidth}.\n- Remove the Markdown "References" list from the body; the bibliography replaces it.`,
     32768
   );
   // Strip any code block markers the LLM might have added
@@ -2062,18 +2460,22 @@ ALL content — including figures, tables, and equations — MUST fit within A4 
     }
   });
 
-  if (ctx.executionDiagnostics?.executionStatus !== "success") {
+  // Disclose a failed empirical execution explicitly. Partial executions are discussed in
+  // the Limitations part of the Discussion (the writing prompts receive the diagnostics),
+  // which avoids appending pipeline-internal messages to an otherwise complete paper.
+  if (ctx.datasetFiles.length > 0 && ctx.executionDiagnostics?.executionStatus === "failed") {
     const failureReasons = ctx.executionDiagnostics?.failureReasons || [];
     const limitationSection = [
-      "\\section*{Execution Limitations}",
-      "The empirical execution did not complete all planned analyses.",
+      "\\section*{Limitations of the Empirical Analysis}",
+      "The empirical analysis of the uploaded data could not be completed, so the results reported here are limited to what is stated in the text.",
       "\\begin{itemize}",
-      ...failureReasons.slice(0, 8).map((reason) => `  \\item ${reason.replace(/[_%$#&{}]/g, " ")}`),
+      ...failureReasons.slice(0, 6).map((reason) => `  \\item ${reason.replace(/[_%$#&{}\\^~]/g, " ").slice(0, 300)}`),
       "\\end{itemize}",
-      "Methods without evidence are treated as planned future work.",
+      "Methods without executed evidence are treated as planned future work.",
     ].join("\n");
-    if (latex.includes("\\end{document}") && !latex.includes("\\section*{Execution Limitations}")) {
-      latex = latex.replace("\\end{document}", `${limitationSection}\n\n\\end{document}`);
+    const anchor = latex.search(/\\begin\{thebibliography\}|\\end\{document\}/);
+    if (anchor >= 0 && !latex.includes("Limitations of the Empirical Analysis")) {
+      latex = `${latex.slice(0, anchor)}${limitationSection}\n\n${latex.slice(anchor)}`;
     }
   }
 
@@ -2130,16 +2532,20 @@ ALL content — including figures, tables, and equations — MUST fit within A4 
     latex += "\n\n\\end{document}";
   }
 
-  ctx.latex = latex;
-  await persistStageAudit(ctx, 20, {
+  // Deterministic figures and tables at the markers (or next to their first mention).
+  const insertion = insertAssetsIntoLatex(latex, ctx.figureManifest, ctx.tableManifest);
+  latex = ensureLatexPackages(insertion.latex);
+
+  await persistStageAudit(ctx, stageNumber, {
     hasRealMetrics,
-    hasRealTables: !!hasRealTables,
+    hasRealTables,
+    assetInsertion: insertion.report,
     methodContract: ctx.methodContract,
     executionDiagnostics: ctx.executionDiagnostics,
     claimVerificationReport: ctx.claimVerificationReport || "",
-    latexLength: ctx.latex.length,
+    latexLength: latex.length,
   });
-  return ctx.latex;
+  return latex;
 }
 
 async function stage21_peerReview(ctx: PipelineContext): Promise<string> {
@@ -2159,7 +2565,7 @@ Method feasibility contract:
 ${formatMethodContract(ctx.methodContract)}
 Execution diagnostics:
 ${formatExecutionDiagnostics(ctx.executionDiagnostics)}
-Body: ${ctx.paperBody || ""}
+${hasAssets(ctx) ? `Figures and tables in the manuscript:\n${assetsBlock(ctx, 12)}\n` : ""}Body: ${ctx.paperBody || ""}
 
 Provide 4 independent reviews, one from each specialist reviewer above. For each review include:
 1. Summary (2-3 sentences)
@@ -2176,19 +2582,67 @@ Then provide a meta-review containing:
 1. Consensus summary
 2. Whether the paper is best classified as empirical or methodological_protocol
 3. Highest-priority blocking issues
-4. Final recommendation`
+4. Final recommendation
+5. A numbered list titled "REQUIRED REVISIONS" with concrete, actionable edits. Tag each item [text] if it can be fixed by rewriting the manuscript (clarity, framing, overclaiming, missing interpretation of a table/figure, missing limitation, inconsistency between text and tables) or [analysis] if it would require new data or estimation.`
   );
   ctx.reviewReport = result;
   return result;
 }
 
+/** Guards against a revision that truncates the paper, drops assets or adds unsupported claims. */
+function assessRevision(ctx: PipelineContext, original: string, revised: string): { ok: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  if (revised.length < original.length * 0.75) reasons.push(`revised body is much shorter (${revised.length} vs ${original.length} characters)`);
+  for (const section of ["Introduction", "Result", "Conclusion"]) {
+    if (!new RegExp(`(?:^|\\n)#+\\s*\\d*\\.?\\s*${section}`, "i").test(revised)) reasons.push(`missing ${section} section`);
+  }
+  const before = markersInText(original);
+  const after = markersInText(revised);
+  const lostFigures = before.figures.filter(n => !after.figures.includes(n));
+  const lostTables = before.tables.filter(n => !after.tables.includes(n));
+  if (lostFigures.length + lostTables.length > Math.max(1, Math.floor((before.figures.length + before.tables.length) * 0.25))) {
+    reasons.push(`dropped asset markers (figures ${lostFigures.join(", ") || "none"}; tables ${lostTables.join(", ") || "none"})`);
+  }
+  const flaggedBefore = buildClaimVerificationReport(ctx, original).flaggedClaims.length;
+  const flaggedAfter = buildClaimVerificationReport(ctx, revised).flaggedClaims.length;
+  if (flaggedAfter > flaggedBefore) reasons.push(`claim verifier flags increased (${flaggedBefore} -> ${flaggedAfter})`);
+  return { ok: reasons.length === 0, reasons };
+}
+
 async function stage22_revision(ctx: PipelineContext): Promise<string> {
-  const result = await callLLM(
-    "You are the paper author revising based on peer review feedback.",
-    `Revise the paper based on these reviews:\n\nReviews:\n${ctx.reviewReport?.substring(0, 8000)}\n\nOriginal paper:\n${ctx.paperBody || ""}\n\nProvide:\n1. Point-by-point response to reviewers\n2. Revised sections (showing changes)\n3. Additional experiments or analysis if requested\n4. Summary of all changes made`
+  const original = ctx.paperBody || "";
+  const response = await callLLM(
+    `You are the corresponding author revising a manuscript after peer review. ${buildFieldContext(ctx)} Address every [text] revision by rewriting; for [analysis] requests that need new data or estimation, do not invent results - acknowledge them as limitations or future work. Never add numbers that are not already in the manuscript's figures, tables or metrics. Keep British English, all [n] citations and every [[FIGURE:n]] / [[TABLE:n]] marker line.`,
+    `Reviews:\n${clip(ctx.reviewReport, 12000)}\n\n${hasAssets(ctx) ? `Figures and tables (unchanged; the only admissible numbers):\n${assetsBlock(ctx, 20)}\n\n` : ""}Current manuscript body (Markdown):\n${original}\n\nReturn exactly two parts:\n\n## Response to Reviewers\n(point-by-point: each required revision, what was changed and where, or why it is deferred)\n\n[REVISED_BODY]\n(the complete revised body in Markdown, all sections from Introduction to References)\n[/REVISED_BODY]`,
+    32768,
   );
-  ctx.revision = result;
-  return result;
+  const revisedMatch = response.match(/\[REVISED_BODY\]([\s\S]*?)(?:\[\/REVISED_BODY\]|$)/i);
+  const letter = (revisedMatch ? response.slice(0, revisedMatch.index) : response).trim();
+  const revisedBody = revisedMatch ? stripCodeBlockMarkers(revisedMatch[1].trim()) : "";
+  ctx.responseToReviewers = letter;
+
+  let status: string;
+  const assessment = revisedBody ? assessRevision(ctx, original, revisedBody) : { ok: false, reasons: ["no revised body returned"] };
+  if (assessment.ok) {
+    ctx.paperBody = revisedBody;
+    ctx.claimVerificationReport = buildClaimVerificationReport(ctx, revisedBody).report;
+    try {
+      ctx.latex = await compileLatexDocument(ctx, revisedBody, 22);
+      status = "Revision applied: the manuscript body was rewritten to address the reviews and the LaTeX source was regenerated.";
+    } catch (err: any) {
+      status = `Revision applied to the Markdown body, but LaTeX regeneration failed (${err?.message}); the stage 20 LaTeX is kept.`;
+    }
+  } else {
+    status = `Revision not applied (${assessment.reasons.join("; ")}); the reviewed manuscript is kept unchanged.`;
+  }
+  await persistStageAudit(ctx, 22, {
+    revisionApplied: assessment.ok,
+    revisionIssues: assessment.reasons,
+    revisedLength: revisedBody.length,
+    originalLength: original.length,
+  });
+  ctx.revision = `${status}\n\n${letter}`;
+  return ctx.revision;
 }
 
 async function stage23_finalCompilation(ctx: PipelineContext): Promise<string> {
@@ -2306,8 +2760,8 @@ async function stage23_finalCompilation(ctx: PipelineContext): Promise<string> {
       console.log(`[Pipeline] ${chartImages.length} chart images will be embedded in PDF`);
     }
 
-    // Generate PDF – prefer LaTeX→HTML→PDF, fall back to Markdown→HTML→PDF
-    const paperMdForPdf = `# ${ctx.topic}\n\n## Abstract\n${ctx.abstract}\n\n${ctx.paperBody}`;
+    // Generate PDF – prefer LaTeX, fall back to Markdown (with figures and tables resolved)
+    const paperMdForPdf = `# ${ctx.topic}\n\n## Abstract\n${ctx.abstract}\n\n${stripAssetMarkers(ctx.paperBody)}`;
     try {
       console.log("[Pipeline] Generating PDF...");
       const pdfBuffer = await generatePaperPdf(
@@ -2336,7 +2790,7 @@ async function stage23_finalCompilation(ctx: PipelineContext): Promise<string> {
     console.warn("[Pipeline] Failed to upload some artifacts:", e);
   }
 
-  const paperMd = `# ${ctx.topic}\n\n## Abstract\n${ctx.abstract}\n\n${ctx.paperBody}`;
+  const paperMd = `# ${ctx.topic}\n\n## Abstract\n${ctx.abstract}\n\n${insertAssetsIntoMarkdown(ctx.paperBody, ctx.figureManifest, ctx.tableManifest)}`;
   await db.updatePipelineRun(ctx.runId, {
     paperMarkdown: paperMd,
     paperLatex: ctx.latex,
@@ -2454,6 +2908,16 @@ export async function executePipeline(
     executionDiagnostics: null,
     methodIntegrityNote: "",
     claimVerificationReport: "",
+    topicAnalysis: "",
+    searchQuery: "",
+    literatureSynthesis: "",
+    researchGaps: "",
+    dataProfile: null,
+    analysisDesign: null,
+    figureManifest: [],
+    tableManifest: [],
+    figureNotes: "",
+    responseToReviewers: "",
   };
 
   await db.updatePipelineRun(runId, { status: "running", currentStage: startStage });
@@ -2556,6 +3020,12 @@ export async function executePipeline(
 /** Update pipeline context when user edits stage output in manual mode */
 function updateContextFromEdit(ctx: PipelineContext, stageNumber: number, editedOutput: string) {
   switch (stageNumber) {
+    case 1:
+      ctx.topicAnalysis = editedOutput;
+      ctx.searchQuery = extractTaggedLine(editedOutput, "SEARCH_QUERY").slice(0, 200) || ctx.searchQuery;
+      break;
+    case 4: ctx.literatureSynthesis = editedOutput; break;
+    case 5: ctx.researchGaps = editedOutput; break;
     case 6: ctx.hypothesis = editedOutput; break;
     case 7: ctx.methodology = editedOutput; break;
     case 8:
@@ -2579,12 +3049,15 @@ function updateContextFromEdit(ctx: PipelineContext, stageNumber: number, edited
       }
       break;
     case 13: ctx.statisticalAnalysis = editedOutput; break;
+    case 14: ctx.figureNotes = editedOutput; ctx.figures = [editedOutput]; break;
     case 16: ctx.outline = editedOutput; break;
     case 17: ctx.abstract = editedOutput; break;
     case 18:
       ctx.paperBody = editedOutput;
       ctx.claimVerificationReport = buildClaimVerificationReport(ctx, editedOutput).report;
       break;
+    case 19: ctx.references = editedOutput.replace(/^Generated BibTeX file[^\n]*\n+/, ""); break;
+    case 20: ctx.latex = editedOutput; break;
     case 21: ctx.reviewReport = editedOutput; break;
     case 22: ctx.revision = editedOutput; break;
   }
