@@ -36,7 +36,7 @@ const FILE_TYPE_ICONS: Record<string, React.ElementType> = {
   other: File,
 };
 
-const ACCEPTED_EXTENSIONS = ".csv,.xlsx,.xls,.dta,.json,.tsv";
+const ACCEPTED_EXTENSIONS = ".csv,.txt,.xlsx,.xls,.xlsm,.dta,.json,.jsonl,.ndjson,.tsv,.tab";
 
 interface UploadedFile {
   id: number;
@@ -134,7 +134,7 @@ export default function Dashboard() {
     }
 
     const ext = file.name.split(".").pop()?.toLowerCase() || "";
-    const allowedExts = ["csv", "xlsx", "xls", "dta", "json", "tsv"];
+    const allowedExts = ["csv", "txt", "xlsx", "xls", "xlsm", "dta", "json", "jsonl", "ndjson", "tsv", "tab"];
     if (!allowedExts.includes(ext)) {
       toast.error(`Unsupported file type: .${ext}. Accepted: ${allowedExts.join(", ")}`);
       return;
@@ -285,7 +285,7 @@ export default function Dashboard() {
                       Drop data files here or click to browse
                     </p>
                     <p className="text-[10px] text-muted-foreground/50 mt-0.5">
-                      CSV, Excel (.xlsx), Stata (.dta), JSON, TSV — max 250MB
+                      CSV/TXT, Excel (.xlsx/.xls), Stata (.dta), JSON/JSON Lines, TSV — max 250MB
                     </p>
                   </>
                 )}

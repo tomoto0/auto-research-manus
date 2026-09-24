@@ -15,6 +15,7 @@ import {
   estimateDatasetMultipartChunks,
 } from "./storage";
 import { insertDatasetFile } from "./db";
+import { collectColumns, dedupeHeaders, detectDelimiter, parseJsonRecords, sheetRowsToRecords, splitDelimitedLine } from "./tabular-utils";
 
 // ─── Helper: parse file preview from downloaded buffer ───
 
@@ -30,11 +31,11 @@ const MAX_COLUMN_NAME_CHARS = 180;
 
 function detectFileType(fileName: string): FileType {
   const ext = fileName.split(".").pop()?.toLowerCase() || "";
-  if (ext === "csv") return "csv";
-  if (["xlsx", "xls"].includes(ext)) return "excel";
+  if (ext === "csv" || ext === "txt") return "csv"; // delimiter is detected from content
+  if (["xlsx", "xls", "xlsm"].includes(ext)) return "excel";
   if (ext === "dta") return "dta";
-  if (ext === "json") return "json";
-  if (ext === "tsv") return "tsv";
+  if (["json", "jsonl", "ndjson"].includes(ext)) return "json";
+  if (ext === "tsv" || ext === "tab") return "tsv";
   return "other";
 }
 
@@ -109,6 +110,46 @@ function buildTabularPreview(
     lines.push(`...[${rows.length - useRows.length} additional preview rows omitted]`);
   }
   return preparePreviewForStorage(lines.join("\n"));
+}
+
+type PreviewResult = { columnNames: string[] | null; rowCount: number | null; preview: string | null };
+
+/** Header, estimated row count and preview for delimited text with any common delimiter. */
+function previewDelimitedText(text: string, fileType: FileType, sizeBytes: number, sampleBytes: number): PreviewResult {
+  const lastBreak = text.lastIndexOf("\n");
+  const complete = lastBreak > 0 && sampleBytes < sizeBytes ? text.slice(0, lastBreak) : text;
+  const lines = complete.split(/\r?\n/).filter(line => line.trim());
+  if (lines.length === 0) return { columnNames: null, rowCount: null, preview: null };
+  const delimiter = detectDelimiter(complete, fileType === "tsv" ? "\t" : ",");
+  const columnNames = dedupeHeaders(splitDelimitedLine(lines[0], delimiter));
+  const avgLineLen = sampleBytes / Math.max(lines.length, 1);
+  const rowCount = sampleBytes >= sizeBytes ? lines.length - 1 : Math.max(0, Math.round(sizeBytes / avgLineLen) - 1);
+  const records = lines.slice(1, 6).map(line => {
+    const cells = splitDelimitedLine(line, delimiter);
+    return Object.fromEntries(columnNames.map((name, i) => [name, cells[i] ?? ""]));
+  });
+  return { columnNames, rowCount, preview: buildTabularPreview(columnNames, records) };
+}
+
+/** Uses the sheet with the most data and skips title rows above the header. */
+function previewWorkbook(XLSX: typeof import("xlsx"), buffer: Buffer): PreviewResult {
+  const workbook = XLSX.read(buffer, { type: "buffer", cellDates: true });
+  let best: { records: Record<string, any>[]; columns: string[] } | null = null;
+  for (const sheetName of workbook.SheetNames) {
+    const sheet = workbook.Sheets[sheetName];
+    if (!sheet) continue;
+    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null, blankrows: false, raw: true }) as unknown[][];
+    const parsed = sheetRowsToRecords(rows);
+    if (!best || parsed.records.length * parsed.columns.length > best.records.length * best.columns.length) {
+      best = { records: parsed.records, columns: parsed.columns };
+    }
+  }
+  if (!best || best.columns.length === 0) return { columnNames: null, rowCount: null, preview: null };
+  return {
+    columnNames: best.columns,
+    rowCount: best.records.length,
+    preview: buildTabularPreview(best.columns, best.records.slice(0, 5)),
+  };
 }
 
 async function parsePreview(
@@ -195,22 +236,15 @@ async function parsePreview(
         const previewBuf = readFileHead(tmpPath, 65536);
         let text = await decodePreviewText(previewBuf);
         if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-        const sep = fileType === "tsv" ? "\t" : ",";
-        const lines = text.split("\n").filter(l => l.trim());
-        if (lines.length > 0) {
-          columnNames = lines[0].split(sep).map(c => c.trim().replace(/^"|"$/g, ""));
-          const avgLineLen = previewBuf.length / Math.max(lines.length, 1);
-          rowCount = Math.max(0, Math.round(sizeBytes / avgLineLen) - 1);
-          preview = lines.slice(0, 6).join("\n");
-        }
+        ({ columnNames, rowCount, preview } = previewDelimitedText(text, fileType, sizeBytes, previewBuf.length));
       } else if (fileType === "json") {
         const head = readFileHead(tmpPath, 65536).toString("utf-8");
         try {
-          const parsed = JSON.parse(head);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            columnNames = Object.keys(parsed[0]);
-            rowCount = parsed.length;
-            preview = JSON.stringify(parsed.slice(0, 3), null, 2);
+          const records = parseJsonRecords(head);
+          if (records.length > 0) {
+            columnNames = collectColumns(records);
+            rowCount = records.length;
+            preview = buildTabularPreview(columnNames, records.slice(0, 5));
           }
         } catch {
           const match = head.match(/\[\s*\{/);
@@ -233,17 +267,7 @@ async function parsePreview(
         if (fileType === "excel") {
           try {
             const XLSX = await import("xlsx");
-            const workbook = XLSX.read(fileBuffer, { type: "buffer" });
-            const sheetName = workbook.SheetNames[0];
-            if (sheetName) {
-              const sheet = workbook.Sheets[sheetName];
-              const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1 }) as any[][];
-              if (jsonData.length > 0) {
-                columnNames = jsonData[0].map((c: any) => String(c ?? "").trim());
-                rowCount = jsonData.length - 1;
-                preview = jsonData.slice(0, 6).map(r => r.join(",")).join("\n");
-              }
-            }
+            ({ columnNames, rowCount, preview } = previewWorkbook(XLSX, fileBuffer!));
           } catch (xlsxErr: any) {
             console.warn("[Upload] Excel parse for preview failed:", xlsxErr.message);
           }
@@ -280,14 +304,7 @@ async function parsePreview(
     const previewBuf = Buffer.from(await resp.arrayBuffer());
     let text = await decodePreviewText(previewBuf);
     if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-    const sep = fileType === "tsv" ? "\t" : ",";
-    const lines = text.split("\n").filter(l => l.trim());
-    if (lines.length > 0) {
-      columnNames = lines[0].split(sep).map(c => c.trim().replace(/^"|"$/g, ""));
-      const avgLineLen = previewBuf.length / Math.max(lines.length, 1);
-      rowCount = Math.max(0, Math.round(sizeBytes / avgLineLen) - 1);
-      preview = lines.slice(0, 6).join("\n");
-    }
+    ({ columnNames, rowCount, preview } = previewDelimitedText(text, fileType, sizeBytes, previewBuf.length));
   } else if (fileType === "json") {
     const resp = await storageDownload(fileKey, {
       timeoutMs: 30000,
@@ -295,11 +312,11 @@ async function parsePreview(
     });
     const partial = await resp.text();
     try {
-      const parsed = JSON.parse(partial);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        columnNames = Object.keys(parsed[0]);
-        rowCount = parsed.length;
-        preview = JSON.stringify(parsed.slice(0, 3), null, 2);
+      const records = parseJsonRecords(partial);
+      if (records.length > 0) {
+        columnNames = collectColumns(records);
+        rowCount = records.length;
+        preview = buildTabularPreview(columnNames, records.slice(0, 5));
       }
     } catch {
       const match = partial.match(/\[\s*\{/);
@@ -342,17 +359,7 @@ async function parsePreview(
       if (fileType === "excel") {
         try {
           const XLSX = await import("xlsx");
-          const workbook = XLSX.read(fileBuffer, { type: "buffer" });
-          const sheetName = workbook.SheetNames[0];
-          if (sheetName) {
-            const sheet = workbook.Sheets[sheetName];
-            const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1 }) as any[][];
-            if (jsonData.length > 0) {
-              columnNames = jsonData[0].map((c: any) => String(c ?? "").trim());
-              rowCount = jsonData.length - 1;
-              preview = jsonData.slice(0, 6).map(r => r.join(",")).join("\n");
-            }
-          }
+          ({ columnNames, rowCount, preview } = previewWorkbook(XLSX, fileBuffer));
         } catch (xlsxErr: any) {
           console.warn("[Upload] Excel parse for preview failed:", xlsxErr.message);
         }

@@ -27,6 +27,17 @@ import * as iconv from "iconv-lite";
 import chardet from "chardet";
 import { invokeLLM } from "./_core/llm";
 import type { AnalysisInputs } from "../shared/pipeline";
+import { renderChartSvg } from "./chart-renderer";
+import {
+  OrderedReservoir,
+  collectColumns,
+  dedupeHeaders,
+  detectDelimiter,
+  normaliseRecords,
+  parseJsonRecords,
+  sheetRowsToRecords,
+  type Delimiter,
+} from "./tabular-utils";
 
 export const EXECUTION_TIMEOUT_MS = 10 * 60_000; // 10 minutes max for dataset-backed experiments
 const MAX_OUTPUT_LENGTH = 50_000;
@@ -143,8 +154,22 @@ export interface ExperimentOutput {
     fileKey?: string;
     mimeType?: string;
     format?: "png" | "svg";
+    /** Publication caption generated alongside the figure. */
+    caption?: string;
+    /** Where the figure belongs in the paper (descriptive / main / diagnostic). */
+    section?: string;
   }[];
-  tables: { name: string; url: string; data: string; description: string }[];
+  tables: {
+    name: string;
+    url: string;
+    data: string;
+    description: string;
+    /** Structured copy of the table so it can be typeset without re-parsing CSV. */
+    headers?: string[];
+    rows?: (string | number)[][];
+    notes?: string;
+    section?: string;
+  }[];
   metrics: Record<string, number | string>;
 }
 
@@ -447,18 +472,28 @@ function detectDelimitedFileEncoding(filePath: string): string {
 
 async function parseDelimitedFileWithEncoding(
   filePath: string,
-  delimiter: "," | "\t",
+  delimiter: Delimiter,
   encoding: string,
-): Promise<{ records: Record<string, any>[]; columns: string[] }> {
+): Promise<{ records: Record<string, any>[]; columns: string[]; totalRows: number; fullDataProfile?: FullDataProfile }> {
   return new Promise((resolve, reject) => {
-    const records: Record<string, any>[] = [];
+    // Keep a bounded, order-preserving random sample in memory for very large files while
+    // streaming summary statistics over every row.
+    const reservoir = new OrderedReservoir<Record<string, any>>(MAX_IN_MEMORY_DATA_ROWS);
+    const profile = createFullDataProfile();
+    let headerColumns: string[] = [];
     const readStream = fs.createReadStream(filePath);
     const decoder = iconv.decodeStream(encoding);
     const parser = csvParseStream({
-      columns: true,
+      columns: (header: string[]) => {
+        headerColumns = dedupeHeaders(header);
+        return headerColumns;
+      },
       skip_empty_lines: true,
+      skip_records_with_empty_values: true,
       delimiter,
       relax_column_count: true,
+      relax_quotes: true,
+      trim: true,
       cast: true,
       bom: true,
     });
@@ -478,14 +513,18 @@ async function parseDelimitedFileWithEncoding(
     };
 
     const onData = (record: unknown) => {
-      records.push(record as Record<string, any>);
+      const row = record as Record<string, any>;
+      reservoir.add(row);
+      updateFullDataProfile(profile, row);
     };
 
     const onEnd = () => {
       cleanup();
       readStream.destroy();
-      const columns = records.length > 0 ? Object.keys(records[0]) : [];
-      resolve({ records, columns });
+      const records = reservoir.values();
+      const columns = headerColumns.length > 0 ? headerColumns : collectColumns(records);
+      const sampled = reservoir.total > records.length;
+      resolve({ records, columns, totalRows: reservoir.total, fullDataProfile: sampled ? profile : undefined });
     };
 
     readStream.on("error", onError);
@@ -498,13 +537,44 @@ async function parseDelimitedFileWithEncoding(
   });
 }
 
+function detectDelimitedFileDelimiter(filePath: string, encoding: string, fallback: Delimiter): Delimiter {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const sample = Buffer.alloc(64 * 1024);
+    const bytesRead = fs.readSync(fd, sample, 0, sample.length, 0);
+    let text: string;
+    try {
+      text = iconv.decode(sample.subarray(0, bytesRead), encoding);
+    } catch {
+      text = sample.subarray(0, bytesRead).toString("utf-8");
+    }
+    // Drop a possibly truncated final line before counting fields.
+    const lastBreak = text.lastIndexOf("\n");
+    return detectDelimiter(lastBreak > 0 ? text.slice(0, lastBreak) : text, fallback);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Keeps at most MAX_IN_MEMORY_DATA_ROWS rows (order-preserving sample) and profiles all rows. */
+function boundRecords(records: Record<string, any>[]): { data: Record<string, any>[]; fullDataProfile?: FullDataProfile } {
+  if (records.length <= MAX_IN_MEMORY_DATA_ROWS) return { data: records };
+  const reservoir = new OrderedReservoir<Record<string, any>>(MAX_IN_MEMORY_DATA_ROWS);
+  const profile = createFullDataProfile();
+  for (const record of records) {
+    reservoir.add(record);
+    updateFullDataProfile(profile, record);
+  }
+  return { data: reservoir.values(), fullDataProfile: profile };
+}
+
 async function parseDelimitedFile(
   filePath: string,
   fileType: "csv" | "tsv",
   rowCountHint?: number,
 ): Promise<ParsedDataFile> {
-  const delimiter = fileType === "tsv" ? "\t" : ",";
   const detectedEncoding = detectDelimitedFileEncoding(filePath);
+  const delimiter = detectDelimitedFileDelimiter(filePath, detectedEncoding, fileType === "tsv" ? "\t" : ",");
   const encodingsToTry = Array.from(new Set([
     detectedEncoding,
     ...(detectedEncoding.toLowerCase().startsWith("utf") ? ["Shift_JIS", "CP932", "EUC-JP"] : []),
@@ -519,16 +589,17 @@ async function parseDelimitedFile(
 
   for (const enc of encodingsToTry) {
     try {
-      const { records, columns } = await parseDelimitedFileWithEncoding(filePath, delimiter, enc);
+      const { records, columns, totalRows: scannedRows, fullDataProfile } = await parseDelimitedFileWithEncoding(filePath, delimiter, enc);
       if (records.length === 0 && columns.length === 0) continue;
       if (hasGarbledColumns(columns) && enc.toLowerCase().startsWith("utf")) continue;
-      const hintedTotal = rowCountHint && rowCountHint > 0 ? rowCountHint : 0;
-      const totalRows = Math.max(hintedTotal, records.length);
       return {
         data: records,
         columns,
-        totalRows,
-        encoding: enc === detectedEncoding ? enc : `${enc} (retry)`,
+        // The streamed row count is exact; the upload-time hint is only an estimate.
+        totalRows: scannedRows || Math.max(rowCountHint ?? 0, records.length),
+        encoding: `${enc === detectedEncoding ? enc : `${enc} (retry)`}, delimiter ${delimiter === "\t" ? "tab" : `"${delimiter}"`}`,
+        materializedRows: records.length,
+        fullDataProfile,
       };
     } catch (err: any) {
       if (!firstError) {
@@ -644,41 +715,50 @@ async function parseDataFile(
   }
 
   if (fileType === "excel") {
-    const workbook = XLSX.readFile(filePath);
-    const sheetName = workbook.SheetNames[0];
-    const sheet = workbook.Sheets[sheetName];
-    const records: Record<string, any>[] = XLSX.utils.sheet_to_json(sheet);
-    const columns = records.length > 0 ? Object.keys(records[0]) : [];
+    // XLSX.readFile is unavailable in the ESM build (no fs binding), so read the bytes ourselves.
+    const workbook = XLSX.read(await fs.promises.readFile(filePath), { type: "buffer", cellDates: true });
+    // Use the sheet holding the most data (the first sheet is often a cover or notes page).
+    let best: { name: string; records: Record<string, any>[]; columns: string[]; cells: number } | null = null;
+    for (const sheetName of workbook.SheetNames) {
+      const sheet = workbook.Sheets[sheetName];
+      if (!sheet) continue;
+      const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null, blankrows: false, raw: true }) as unknown[][];
+      const { records, columns } = sheetRowsToRecords(rows);
+      const cells = records.length * columns.length;
+      if (!best || cells > best.cells) best = { name: sheetName, records, columns, cells };
+    }
+    const records = best?.records || [];
+    const bounded = boundRecords(records);
     return {
-      data: records,
-      columns,
-      totalRows: Math.max(hintedRows ?? 0, records.length),
+      data: bounded.data,
+      columns: best?.columns || [],
+      totalRows: records.length,
+      encoding: best ? `sheet "${best.name}" of ${workbook.SheetNames.length}` : undefined,
+      materializedRows: bounded.data.length,
+      fullDataProfile: bounded.fullDataProfile,
     };
   }
 
   if (fileType === "json") {
     const raw = fs.readFileSync(filePath, "utf-8");
-    let parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      for (const key of Object.keys(parsed)) {
-        if (Array.isArray(parsed[key])) {
-          parsed = parsed[key];
-          break;
-        }
-      }
-    }
-    if (!Array.isArray(parsed)) {
-      parsed = [parsed];
-    }
-    const columns = parsed.length > 0 ? Object.keys(parsed[0]) : [];
+    const records = parseJsonRecords(raw);
+    const columns = collectColumns(records);
+    const bounded = boundRecords(records);
     return {
-      data: parsed,
+      data: bounded.data,
       columns,
-      totalRows: Math.max(hintedRows ?? 0, parsed.length),
+      totalRows: records.length,
+      materializedRows: bounded.data.length,
+      fullDataProfile: bounded.fullDataProfile,
     };
   }
 
   throw new Error(`Unsupported file type: ${fileType}`);
+}
+
+/** Test hook: parse + normalise a local data file exactly as the experiment runner does. */
+export async function __testParseDataFile(filePath: string, fileType: string): Promise<ParsedDataFile> {
+  return parseAndValidateDataFile(filePath, fileType);
 }
 
 /** Wrapper that parses and validates a data file */
@@ -689,6 +769,12 @@ async function parseAndValidateDataFile(
   options?: DatasetParseOptions,
 ): Promise<ParsedDataFile> {
   const result = await parseDataFile(filePath, fileType, rowCountHint, options);
+  // Unify missing codes and numbers stored as text ("1,234", "12%", full-width digits)
+  // so that every downstream estimator sees clean numeric columns.
+  const converted = normaliseRecords(result.data, result.columns);
+  if (converted.length > 0) {
+    console.log(`[DataParse] Converted ${converted.length} text column(s) to numeric: ${converted.slice(0, 10).join(", ")}`);
+  }
   validateParsedData(result, fileType);
   return result;
 }
@@ -806,12 +892,16 @@ function applySafeChartFontConfig(config: any): any {
   return config;
 }
 
+/** Supersampling factor for chart rasterisation (2x keeps figures crisp in the PDF). */
+export const CHART_RASTER_SCALE = 2;
+
 async function svgToPng(svgBuffer: Buffer, width: number, height: number): Promise<Buffer> {
   try {
     const sharp = (await import("sharp")).default;
-    const pngBuffer = await sharp(sanitizeSvgForRasterization(svgBuffer))
-      .resize(width, height)
-      .png()
+    const pngBuffer = await sharp(sanitizeSvgForRasterization(svgBuffer), { density: 72 * CHART_RASTER_SCALE })
+      .resize(Math.round(width * CHART_RASTER_SCALE), Math.round(height * CHART_RASTER_SCALE), { fit: "fill" })
+      .flatten({ background: "#ffffff" })
+      .png({ compressionLevel: 9 })
       .toBuffer();
     return pngBuffer;
   } catch (err: any) {
@@ -834,8 +924,7 @@ async function renderChartToPng(
 ): Promise<Buffer> {
   const preferCanvasRenderer = process.env.CHART_RENDERER === "canvas";
 
-  // Strategy 1: Generate SVG and convert to PNG via sharp
-  console.log(`[Chart] Falling back to SVG + sharp PNG conversion...`);
+  // Strategy 1: Generate SVG with the layout-aware renderer and rasterise via sharp
   const svgBuffer = generateSvgFallbackChart(chartConfigJs, width, height);
   const pngBuffer = await svgToPng(svgBuffer, width, height);
 
@@ -884,9 +973,8 @@ async function renderChartToPng(
 }
 
 /**
- * Generate an SVG chart as a fallback when chartjs-node-canvas is unavailable.
- * Supports bar/line/scatter/bubble/pie to avoid malformed placeholder visuals.
- * Returns SVG as buffer.
+ * Render a Chart.js-style configuration to SVG with the layout-aware renderer.
+ * Labels are transliterated to ASCII first so librsvg never draws replacement boxes.
  */
 export function generateSvgFallbackChart(
   chartConfigJs: string,
@@ -904,594 +992,12 @@ export function generateSvgFallbackChart(
     }
   }
 
-  // Transliterate non-ASCII labels to prevent □□□□ garbling
+  // Transliterate non-ASCII labels to prevent replacement-box garbling
   config = transliterateChartConfigSync(config);
-
-  const rawTitle = config.options?.plugins?.title?.text;
-  let title = Array.isArray(rawTitle)
-    ? String(rawTitle.join(" "))
-    : String(rawTitle || config.type || "Chart");
-  // Keep chart titles readable in rasterized SVG by translating/transliterating non-ASCII text instead of dropping it.
-  title = ensureAsciiLabelSync(title, "Chart").trim() || "Chart";
-  const chartType = String(config.type || "bar").toLowerCase();
-  const datasets: any[] = Array.isArray(config.data?.datasets) ? config.data.datasets : [];
-  const labels: string[] = Array.isArray(config.data?.labels)
-    ? config.data.labels.map((l: any) => String(l))
-    : [];
-
-  const asNumber = (value: unknown): number | null => {
-    const n = typeof value === "number" ? value : Number(value);
-    return Number.isFinite(n) ? n : null;
-  };
-  const clamp = (value: number, min: number, max: number): number => Math.min(max, Math.max(min, value));
-  const normaliseRange = (min: number, max: number): [number, number] => {
-    if (!Number.isFinite(min) || !Number.isFinite(max)) return [0, 1];
-    if (min === max) {
-      const delta = Math.abs(min) > 1 ? Math.abs(min) * 0.1 : 1;
-      return [min - delta, max + delta];
-    }
-    return [min, max];
-  };
-  const shortLabel = (value: unknown, maxLen = 30): string => {
-    const text = ensureAsciiLabelSync(String(value ?? ""), "Label").replace(/\s+/g, " ").trim() || "N/A";
-    return text.length > maxLen ? `${text.slice(0, maxLen - 3)}...` : text;
-  };
-  const readRecord = (value: unknown): Record<string, unknown> =>
-    value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-  const readArray = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
-  type PieSlice = { value: number; label: string; color: string };
-  type BubblePoint = { x: number; y: number; r: number };
-  type LinePoint = { x: number; y: number };
-  type RenderSeries<T> = { label: string; color: string; points: T[] };
-
-  // CRITICAL: Use ONLY the generic CSS keyword 'sans-serif' without quotes.
-  // Named fonts like 'DejaVu Sans', 'Arial' etc. cause sharp/librsvg to render ALL text
-  // as □□□□ replacement characters when those specific fonts aren't installed.
-  // The unquoted generic keyword 'sans-serif' always has a system fallback in librsvg.
-  const fontFamily = `sans-serif`;
-
-  const estimatedLegendCount = Math.min(datasets.length, 6);
-  const estimatedLegendRows = estimatedLegendCount > 0
-    ? Math.ceil(estimatedLegendCount / (Math.max(...datasets.slice(0, estimatedLegendCount).map((item, i) => String(item?.label || `Dataset ${i + 1}`).length)) > 22 ? Math.min(2, estimatedLegendCount) : Math.min(3, estimatedLegendCount)))
-    : 0;
-  const bottomPadding = chartType !== "pie" && chartType !== "doughnut" && chartType !== "heatmap" && estimatedLegendRows > 0
-    ? Math.max(104, 84 + estimatedLegendRows * 24)
-    : 84;
-  const padding = { top: 56, right: 36, bottom: bottomPadding, left: 64 };
-  const plotX = padding.left;
-  const plotY = padding.top;
-  const plotWidth = Math.max(160, width - padding.left - padding.right);
-  const plotHeight = Math.max(140, height - padding.top - padding.bottom);
-  const plotBottomY = plotY + plotHeight;
-
-  const palette = [
-    "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949",
-    "#af7aa1", "#ff9da7", "#9c755f", "#bab0ab",
-  ];
-  const pickColor = (dsIndex: number, colorValue: unknown): string => {
-    if (typeof colorValue === "string" && colorValue.trim().length > 0) return colorValue;
-    if (Array.isArray(colorValue) && typeof colorValue[0] === "string") return colorValue[0];
-    return palette[dsIndex % palette.length];
-  };
-  const mapLinear = (value: number, min: number, max: number, outMin: number, outMax: number): number => {
-    const [safeMin, safeMax] = normaliseRange(min, max);
-    const t = (value - safeMin) / (safeMax - safeMin);
-    return outMin + t * (outMax - outMin);
-  };
-  const formatTick = (value: number): string => {
-    const abs = Math.abs(value);
-    if (abs >= 1000) return value.toFixed(0);
-    if (abs >= 100) return value.toFixed(1);
-    if (abs >= 10) return value.toFixed(2);
-    return value.toFixed(3);
-  };
-
-  const parts: string[] = [];
-  parts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`);
-  parts.push(`<style>text { font-family: sans-serif; font-size: 12px; }</style>`);
-  parts.push(`<rect width="${width}" height="${height}" fill="#ffffff"/>`);
-  parts.push(`<text x="${width / 2}" y="30" text-anchor="middle" font-size="16" font-weight="bold" fill="#333">${escapeXml(shortLabel(title, 90))}</text>`);
-
-  const drawNoDataMessage = (message: string) => {
-    parts.push(`<text x="${width / 2}" y="${plotY + plotHeight / 2}" text-anchor="middle" font-size="12" fill="#999">${escapeXml(message)}</text>`);
-  };
-  const drawCartesianFrame = (minY: number, maxY: number) => {
-    const [safeMinY, safeMaxY] = normaliseRange(minY, maxY);
-    for (let i = 0; i <= 4; i++) {
-      const t = i / 4;
-      const y = plotY + t * plotHeight;
-      const value = safeMaxY - t * (safeMaxY - safeMinY);
-      parts.push(`<line x1="${plotX}" y1="${y}" x2="${plotX + plotWidth}" y2="${y}" stroke="#ececec" stroke-width="1"/>`);
-      parts.push(`<text x="${plotX - 8}" y="${y + 3}" text-anchor="end" font-size="9" fill="#666">${escapeXml(formatTick(value))}</text>`);
-    }
-    parts.push(`<line x1="${plotX}" y1="${plotBottomY}" x2="${plotX + plotWidth}" y2="${plotBottomY}" stroke="#999" stroke-width="1"/>`);
-    parts.push(`<line x1="${plotX}" y1="${plotY}" x2="${plotX}" y2="${plotBottomY}" stroke="#999" stroke-width="1"/>`);
-    return [safeMinY, safeMaxY] as [number, number];
-  };
-
-  if (chartType === "pie" || chartType === "doughnut") {
-    const pieDataset = readRecord(datasets[0]);
-    const rawValues = readArray(pieDataset.data);
-    const backgroundColors = readArray(pieDataset.backgroundColor);
-    const slices: PieSlice[] = rawValues
-      .map((value: unknown, i: number) => {
-        const n = asNumber(value);
-        return {
-          value: n === null ? 0 : Math.max(0, n),
-          label: shortLabel(labels[i] || `Category ${i + 1}`, 22),
-          color: pickColor(i, backgroundColors.length > 0 ? backgroundColors[i] : pieDataset.backgroundColor),
-        };
-      })
-      .filter((s: PieSlice) => s.value > 0);
-
-    const total = slices.reduce((sum: number, s: PieSlice) => sum + s.value, 0);
-    if (total <= 0) {
-      drawNoDataMessage("No positive values available for pie chart.");
-    } else {
-      const cx = plotX + plotWidth * 0.35;
-      const cy = plotY + plotHeight * 0.5;
-      const r = Math.max(40, Math.min(plotWidth * 0.24, plotHeight * 0.42));
-      let startAngle = -Math.PI / 2;
-      for (const slice of slices) {
-        const sweep = (slice.value / total) * Math.PI * 2;
-        const endAngle = startAngle + sweep;
-        const sx = cx + r * Math.cos(startAngle);
-        const sy = cy + r * Math.sin(startAngle);
-        const ex = cx + r * Math.cos(endAngle);
-        const ey = cy + r * Math.sin(endAngle);
-        const largeArc = sweep > Math.PI ? 1 : 0;
-        parts.push(
-          `<path d="M ${cx} ${cy} L ${sx} ${sy} A ${r} ${r} 0 ${largeArc} 1 ${ex} ${ey} Z" fill="${slice.color}" stroke="#ffffff" stroke-width="1"/>`
-        );
-        startAngle = endAngle;
-      }
-      if (chartType === "doughnut") {
-        parts.push(`<circle cx="${cx}" cy="${cy}" r="${r * 0.52}" fill="#ffffff"/>`);
-      }
-      const legendX = plotX + plotWidth * 0.62;
-      let legendY = plotY + 12;
-      const maxLegend = Math.min(slices.length, 10);
-      for (let i = 0; i < maxLegend; i++) {
-        const slice = slices[i];
-        const pct = ((slice.value / total) * 100).toFixed(1);
-        parts.push(`<rect x="${legendX}" y="${legendY - 8}" width="10" height="10" fill="${slice.color}"/>`);
-        parts.push(`<text x="${legendX + 14}" y="${legendY}" font-size="10" fill="#666">${escapeXml(`${slice.label} (${pct}%)`)}</text>`);
-        legendY += 16;
-      }
-      if (slices.length > maxLegend) {
-        parts.push(`<text x="${legendX}" y="${legendY}" font-size="10" fill="#888">${escapeXml(`... ${slices.length - maxLegend} more categories`)}</text>`);
-      }
-    }
-  } else if (chartType === "scatter" || chartType === "bubble") {
-    const allSeries: RenderSeries<BubblePoint>[] = datasets.map((ds, dsIndex) => {
-      const dsRecord = readRecord(ds);
-      const dsData = readArray(dsRecord.data);
-      const points = dsData
-        .map((raw: any, idx: number) => {
-          if (raw && typeof raw === "object") {
-            const pointRecord = raw as Record<string, unknown>;
-            const x = asNumber(pointRecord.x);
-            const y = asNumber(pointRecord.y);
-            const r = asNumber(pointRecord.r);
-            if (x === null || y === null) return null;
-            return { x, y, r: r === null ? 4 : clamp(r, 2, 16) };
-          }
-          const y = asNumber(raw);
-          if (y === null) return null;
-          return { x: idx, y, r: 4 };
-        })
-        .filter((p): p is { x: number; y: number; r: number } => p !== null);
-      return {
-        label: shortLabel(dsRecord.label || `Dataset ${dsIndex + 1}`, 28),
-        color: pickColor(dsIndex, dsRecord.backgroundColor || dsRecord.borderColor),
-        points,
-      };
-    }).filter((s: RenderSeries<BubblePoint>) => s.points.length > 0);
-
-    if (allSeries.length === 0) {
-      drawNoDataMessage("No numeric points available for scatter chart.");
-    } else {
-      const xs = allSeries.flatMap((s) => s.points.map((p: BubblePoint) => p.x));
-      const ys = allSeries.flatMap((s) => s.points.map((p: BubblePoint) => p.y));
-      const [minX, maxX] = normaliseRange(Math.min(...xs), Math.max(...xs));
-      const [minY, maxY] = drawCartesianFrame(Math.min(...ys), Math.max(...ys));
-      const mapX = (x: number): number => mapLinear(x, minX, maxX, plotX, plotX + plotWidth);
-      const mapY = (y: number): number => mapLinear(y, minY, maxY, plotBottomY, plotY);
-
-      for (const series of allSeries) {
-        // Limit scatter points in SVG to avoid visual noise
-        const maxScatterPoints = 200;
-        const renderPoints = series.points.length > maxScatterPoints
-          ? series.points.filter((_, i) => i % Math.ceil(series.points.length / maxScatterPoints) === 0)
-          : series.points;
-        for (const point of renderPoints) {
-          const cx = mapX(point.x);
-          const cy = mapY(point.y);
-          const radius = chartType === "bubble" ? point.r : 3;
-          if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
-          parts.push(`<circle cx="${cx}" cy="${cy}" r="${radius}" fill="${series.color}" fill-opacity="0.65" stroke="${series.color}" stroke-width="1"/>`);
-        }
-      }
-
-      // X-axis tick labels for scatter/bubble
-      const xTickCount = 5;
-      for (let i = 0; i <= xTickCount; i++) {
-        const t = i / xTickCount;
-        const value = minX + t * (maxX - minX);
-        const x = plotX + t * plotWidth;
-        parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(formatTick(value))}</text>`);
-      }
-    }
-  } else if (chartType === "line") {
-    const series: RenderSeries<LinePoint>[] = datasets.map((ds, dsIndex) => {
-      const dsRecord = readRecord(ds);
-      const dsData = readArray(dsRecord.data);
-      const points = dsData
-        .map((raw: any, idx: number) => {
-          const value = raw && typeof raw === "object" ? asNumber(raw.y) : asNumber(raw);
-          if (value === null) return null;
-          return { x: idx, y: value };
-        })
-        .filter((p): p is LinePoint => p !== null);
-      return {
-        label: shortLabel(dsRecord.label || `Dataset ${dsIndex + 1}`, 28),
-        color: pickColor(dsIndex, dsRecord.borderColor || dsRecord.backgroundColor),
-        points,
-      };
-    }).filter((s: RenderSeries<LinePoint>) => s.points.length > 1);
-
-    if (series.length === 0) {
-      drawNoDataMessage("No line-series values available.");
-    } else {
-      const yValues = series.flatMap((s) => s.points.map((p: LinePoint) => p.y));
-      const maxPoints = Math.max(...series.map((s) => s.points.length));
-      const [minY, maxY] = drawCartesianFrame(Math.min(...yValues), Math.max(...yValues));
-      const [minX, maxX] = normaliseRange(0, Math.max(1, maxPoints - 1));
-      const mapX = (x: number): number => mapLinear(x, minX, maxX, plotX, plotX + plotWidth);
-      const mapY = (y: number): number => mapLinear(y, minY, maxY, plotBottomY, plotY);
-
-      for (const s of series) {
-        const path = s.points
-          .map((p: LinePoint, i: number) => `${i === 0 ? "M" : "L"} ${mapX(p.x).toFixed(2)} ${mapY(p.y).toFixed(2)}`)
-          .join(" ");
-        parts.push(`<path d="${path}" fill="none" stroke="${s.color}" stroke-width="2"/>`);
-        for (const p of s.points) {
-          parts.push(`<circle cx="${mapX(p.x)}" cy="${mapY(p.y)}" r="2.3" fill="${s.color}"/>`);
-        }
-      }
-
-      const lineTickMax = 12;
-      const lineTickStep = Math.max(1, Math.ceil(Math.max(labels.length, maxPoints) / lineTickMax));
-      const lineLabelCount = Math.max(labels.length, maxPoints);
-      const lineUseRotation = lineLabelCount / lineTickStep > 8;
-      for (let i = 0; i < lineLabelCount; i += lineTickStep) {
-        const x = mapX(i);
-        const text = shortLabel(labels[i] || `${i + 1}`, lineUseRotation ? 18 : 14);
-        if (lineUseRotation) {
-          parts.push(`<text x="${x}" y="${plotBottomY + 12}" text-anchor="end" font-size="8" fill="#666" transform="rotate(-35, ${x}, ${plotBottomY + 12})">${escapeXml(text)}</text>`);
-        } else {
-          parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(text)}</text>`);
-        }
-      }
-    }
-  } else if (chartType === "heatmap") {
-    // Custom heatmap rendering for correlation matrices and similar grid data
-    const heatmapLabels: string[] = labels.length > 0 ? labels : [];
-    const heatmapData: { x: number; y: number; v: number }[] = [];
-    if (datasets.length > 0 && Array.isArray(datasets[0]?.data)) {
-      for (const d of datasets[0].data) {
-        if (d && typeof d === "object" && "x" in d && "y" in d && "v" in d) {
-          const x = asNumber(d.x), y = asNumber(d.y), v = asNumber(d.v);
-          if (x !== null && y !== null && v !== null) heatmapData.push({ x, y, v });
-        }
-      }
-    }
-    const gridSize = heatmapLabels.length;
-    if (gridSize < 2 || heatmapData.length === 0) {
-      drawNoDataMessage("No heatmap data available.");
-    } else {
-      // Reserve space for axis labels
-      const labelSpace = 80;
-      const gridX = plotX + labelSpace;
-      const gridY = plotY + 8;
-      const gridWidth = plotWidth - labelSpace;
-      const gridHeight = plotHeight - 30;
-      const cellW = gridWidth / gridSize;
-      const cellH = gridHeight / gridSize;
-
-      // Color interpolation: blue (positive) to white (zero) to red (negative)
-      const heatColor = (v: number): string => {
-        const clamped = Math.max(-1, Math.min(1, v));
-        const abs = Math.abs(clamped);
-        if (clamped >= 0) {
-          // White to blue
-          const r = Math.round(255 * (1 - abs * 0.7));
-          const g = Math.round(255 * (1 - abs * 0.5));
-          const b = 255;
-          return `rgb(${r},${g},${b})`;
-        } else {
-          // White to red
-          const r = 255;
-          const g = Math.round(255 * (1 - abs * 0.6));
-          const b = Math.round(255 * (1 - abs * 0.7));
-          return `rgb(${r},${g},${b})`;
-        }
-      };
-
-      // Draw cells
-      for (const cell of heatmapData) {
-        const cx = gridX + cell.x * cellW;
-        const cy = gridY + cell.y * cellH;
-        parts.push(`<rect x="${cx}" y="${cy}" width="${cellW}" height="${cellH}" fill="${heatColor(cell.v)}" stroke="#fff" stroke-width="1"/>`);
-        // Show correlation value in cell
-        if (cellW >= 20 && cellH >= 16) {
-          const textColor = Math.abs(cell.v) > 0.6 ? "#fff" : "#333";
-          const fontSize = Math.min(10, Math.max(7, cellW / 4));
-          parts.push(`<text x="${cx + cellW / 2}" y="${cy + cellH / 2 + fontSize / 3}" text-anchor="middle" font-size="${fontSize}" fill="${textColor}">${cell.v.toFixed(2)}</text>`);
-        }
-      }
-
-      // Y-axis labels (left side)
-      for (let i = 0; i < gridSize; i++) {
-        const y = gridY + i * cellH + cellH / 2 + 3;
-        const lbl = shortLabel(heatmapLabels[i] || `${i}`, 14);
-        parts.push(`<text x="${gridX - 6}" y="${y}" text-anchor="end" font-size="9" fill="#444">${escapeXml(lbl)}</text>`);
-      }
-
-      // X-axis labels (bottom, rotated)
-      for (let i = 0; i < gridSize; i++) {
-        const x = gridX + i * cellW + cellW / 2;
-        const y = gridY + gridHeight + 10;
-        const lbl = shortLabel(heatmapLabels[i] || `${i}`, 14);
-        parts.push(`<text x="${x}" y="${y}" text-anchor="end" font-size="9" fill="#444" transform="rotate(-45, ${x}, ${y})">${escapeXml(lbl)}</text>`);
-      }
-
-      // Color legend
-      const legendW = 120, legendH = 10;
-      const legendX = gridX + gridWidth / 2 - legendW / 2;
-      const legendY = plotBottomY + 42;
-      const gradSteps = 20;
-      for (let i = 0; i < gradSteps; i++) {
-        const v = -1 + (2 * i) / (gradSteps - 1);
-        const sx = legendX + (i / gradSteps) * legendW;
-        parts.push(`<rect x="${sx}" y="${legendY}" width="${legendW / gradSteps + 1}" height="${legendH}" fill="${heatColor(v)}"/>`);
-      }
-      parts.push(`<text x="${legendX}" y="${legendY + legendH + 12}" text-anchor="middle" font-size="8" fill="#666">-1</text>`);
-      parts.push(`<text x="${legendX + legendW / 2}" y="${legendY + legendH + 12}" text-anchor="middle" font-size="8" fill="#666">0</text>`);
-      parts.push(`<text x="${legendX + legendW}" y="${legendY + legendH + 12}" text-anchor="middle" font-size="8" fill="#666">+1</text>`);
-    }
-  } else {
-    // Default to bar-like rendering for bar and unknown cartesian types.
-    const isHorizontal = config.options?.indexAxis === "y";
-    const isStacked = !!(config.options?.scales?.x?.stacked || config.options?.scales?.y?.stacked);
-    const categoryCount = labels.length > 0
-      ? labels.length
-      : Math.max(0, ...datasets.map((d) => Array.isArray(d?.data) ? d.data.length : 0));
-
-    if (categoryCount === 0 || datasets.length === 0) {
-      drawNoDataMessage("No categorical values available for bar chart.");
-    } else {
-      // Parse numeric values per dataset per category
-      const numericValues = datasets.map((ds) => Array.from({ length: categoryCount }, (_, i) => {
-        const raw = Array.isArray(ds?.data) ? ds.data[i] : null;
-        if (Array.isArray(raw) && raw.length >= 2) {
-          const low = asNumber(raw[0]);
-          const high = asNumber(raw[1]);
-          if (low !== null && high !== null) return Math.max(low, high);
-          return null;
-        }
-        const n = raw && typeof raw === "object" ? asNumber(raw.y) : asNumber(raw);
-        return n;
-      }));
-
-      if (isHorizontal) {
-        // --- Horizontal bar rendering (indexAxis: "y") ---
-        // Value axis is X (horizontal), category axis is Y (vertical)
-        const allVals = numericValues.flatMap(row => row.filter((v): v is number => v !== null));
-        if (allVals.length === 0) {
-          drawNoDataMessage("No numeric bar values available.");
-        } else {
-          const minVal = Math.min(0, ...allVals);
-          const maxVal = Math.max(...allVals);
-          const [safeMin, safeMax] = normaliseRange(minVal, maxVal);
-          // Draw horizontal grid lines and value axis labels along bottom
-          for (let i = 0; i <= 4; i++) {
-            const t = i / 4;
-            const x = plotX + t * plotWidth;
-            const value = safeMin + t * (safeMax - safeMin);
-            parts.push(`<line x1="${x}" y1="${plotY}" x2="${x}" y2="${plotBottomY}" stroke="#ececec" stroke-width="1"/>`);
-            parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(formatTick(value))}</text>`);
-          }
-          parts.push(`<line x1="${plotX}" y1="${plotBottomY}" x2="${plotX + plotWidth}" y2="${plotBottomY}" stroke="#999" stroke-width="1"/>`);
-          parts.push(`<line x1="${plotX}" y1="${plotY}" x2="${plotX}" y2="${plotBottomY}" stroke="#999" stroke-width="1"/>`);
-
-          const groupHeight = plotHeight / categoryCount;
-          const innerPadding = Math.min(8, groupHeight * 0.18);
-          const barSlotH = Math.max(groupHeight - innerPadding, 2);
-          const barH = Math.max(1.6, Math.min(28, barSlotH / Math.max(datasets.length, 1)));
-          const mapX = (v: number): number => mapLinear(v, safeMin, safeMax, plotX, plotX + plotWidth);
-          const baselineX = mapX(0);
-
-          for (let i = 0; i < categoryCount; i++) {
-            const yStart = plotY + i * groupHeight + innerPadding / 2;
-            for (let dsIndex = 0; dsIndex < datasets.length; dsIndex++) {
-              const val = numericValues[dsIndex][i];
-              if (val === null) continue;
-              const xEnd = mapX(val);
-              const rectX = Math.min(baselineX, xEnd);
-              const rectW = Math.max(1, Math.abs(xEnd - baselineX));
-              const y = yStart + dsIndex * barH;
-              const fill = pickColor(dsIndex, datasets[dsIndex]?.backgroundColor);
-              parts.push(`<rect x="${rectX}" y="${y}" width="${rectW}" height="${Math.max(1, barH - 1)}" fill="${fill}" fill-opacity="0.78" rx="1.4"/>`);
-            }
-          }
-
-          // Category labels on Y axis
-          const maxTickLabels = 20;
-          const tickStep = Math.max(1, Math.ceil(categoryCount / maxTickLabels));
-          for (let i = 0; i < categoryCount; i += tickStep) {
-            const y = plotY + i * groupHeight + groupHeight / 2 + 3;
-            const text = shortLabel(labels[i] || `${i + 1}`, 18);
-            parts.push(`<text x="${plotX - 6}" y="${y}" text-anchor="end" font-size="9" fill="#666">${escapeXml(text)}</text>`);
-          }
-        }
-      } else if (isStacked) {
-        // --- Stacked bar rendering ---
-        // Compute cumulative sums per category for stacking
-        const stackSums = Array.from({ length: categoryCount }, (_, i) => {
-          let sum = 0;
-          for (let dsIndex = 0; dsIndex < datasets.length; dsIndex++) {
-            const val = numericValues[dsIndex][i];
-            if (val !== null && val > 0) sum += val;
-          }
-          return sum;
-        });
-        const maxStack = Math.max(...stackSums, 0);
-        if (maxStack <= 0) {
-          drawNoDataMessage("No positive stacked values available.");
-        } else {
-          const [minY, maxY] = drawCartesianFrame(0, maxStack);
-          const mapY = (y: number): number => mapLinear(y, minY, maxY, plotBottomY, plotY);
-          const baselineY = mapY(0);
-          parts.push(`<line x1="${plotX}" y1="${baselineY}" x2="${plotX + plotWidth}" y2="${baselineY}" stroke="#c9c9c9" stroke-width="1"/>`);
-
-          const groupWidth = plotWidth / categoryCount;
-          const innerPadding = Math.min(10, groupWidth * 0.18);
-          const barWidth = Math.max(2, groupWidth - innerPadding);
-
-          for (let i = 0; i < categoryCount; i++) {
-            let cumY = 0;
-            const xStart = plotX + i * groupWidth + innerPadding / 2;
-            for (let dsIndex = 0; dsIndex < datasets.length; dsIndex++) {
-              const val = numericValues[dsIndex][i];
-              if (val === null || val <= 0) continue;
-              const yBottom = mapY(cumY);
-              const yTop = mapY(cumY + val);
-              const rectY = Math.min(yTop, yBottom);
-              const rectH = Math.max(1, Math.abs(yBottom - yTop));
-              const fill = pickColor(dsIndex, datasets[dsIndex]?.backgroundColor);
-              parts.push(`<rect x="${xStart}" y="${rectY}" width="${Math.max(1, barWidth - 1)}" height="${rectH}" fill="${fill}" fill-opacity="0.78" rx="1.4"/>`);
-              cumY += val;
-            }
-          }
-
-          const maxTickLabels = 15;
-          const tickStep = Math.max(1, Math.ceil(categoryCount / maxTickLabels));
-          const useRotation = categoryCount > 8;
-          for (let i = 0; i < categoryCount; i += tickStep) {
-            const x = plotX + i * groupWidth + groupWidth / 2;
-            const text = shortLabel(labels[i] || `${i + 1}`, useRotation ? 18 : 14);
-            if (useRotation) {
-              parts.push(`<text x="${x}" y="${plotBottomY + 12}" text-anchor="end" font-size="8" fill="#666" transform="rotate(-35, ${x}, ${plotBottomY + 12})">${escapeXml(text)}</text>`);
-            } else {
-              parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(text)}</text>`);
-            }
-          }
-        }
-      } else {
-        // --- Default grouped bar rendering ---
-        const valueRanges = datasets.map((ds) => Array.from({ length: categoryCount }, (_, i) => {
-          const raw = Array.isArray(ds?.data) ? ds.data[i] : null;
-          if (Array.isArray(raw) && raw.length >= 2) {
-            const low = asNumber(raw[0]);
-            const high = asNumber(raw[1]);
-            if (low !== null && high !== null) {
-              return { low: Math.min(low, high), high: Math.max(low, high) };
-            }
-            return null;
-          }
-          const n = raw && typeof raw === "object" ? asNumber(raw.y) : asNumber(raw);
-          if (n === null) return null;
-          return { low: Math.min(0, n), high: Math.max(0, n) };
-        }));
-        const allLow = valueRanges.flatMap((row) => row.map((v) => v?.low).filter((v): v is number => typeof v === "number"));
-        const allHigh = valueRanges.flatMap((row) => row.map((v) => v?.high).filter((v): v is number => typeof v === "number"));
-        if (allLow.length === 0 || allHigh.length === 0) {
-          drawNoDataMessage("No numeric bar values available.");
-        } else {
-          const [minY, maxY] = drawCartesianFrame(Math.min(...allLow), Math.max(...allHigh));
-          const mapY = (y: number): number => mapLinear(y, minY, maxY, plotBottomY, plotY);
-          const baselineY = mapY(0);
-          parts.push(`<line x1="${plotX}" y1="${baselineY}" x2="${plotX + plotWidth}" y2="${baselineY}" stroke="#c9c9c9" stroke-width="1"/>`);
-
-          const groupWidth = plotWidth / categoryCount;
-          const innerPadding = Math.min(10, groupWidth * 0.18);
-          const barSlotWidth = Math.max(groupWidth - innerPadding, 2);
-          const barWidth = Math.max(1.6, Math.min(36, barSlotWidth / Math.max(datasets.length, 1)));
-
-          for (let i = 0; i < categoryCount; i++) {
-            const xStart = plotX + i * groupWidth + innerPadding / 2;
-            for (let dsIndex = 0; dsIndex < datasets.length; dsIndex++) {
-              const range = valueRanges[dsIndex][i];
-              if (!range) continue;
-              const yTop = mapY(range.high);
-              const yBottom = mapY(range.low);
-              const rectY = Math.min(yTop, yBottom);
-              const rectH = Math.max(1, Math.abs(yBottom - yTop));
-              const x = xStart + dsIndex * barWidth;
-              const fill = pickColor(dsIndex, datasets[dsIndex]?.backgroundColor);
-              parts.push(`<rect x="${x}" y="${rectY}" width="${Math.max(1, barWidth - 1)}" height="${rectH}" fill="${fill}" fill-opacity="0.78" rx="1.4"/>`);
-            }
-          }
-
-          const maxTickLabels = 15;
-          const tickStep = Math.max(1, Math.ceil(categoryCount / maxTickLabels));
-          const useRotation = categoryCount > 8;
-          for (let i = 0; i < categoryCount; i += tickStep) {
-            const x = plotX + i * groupWidth + groupWidth / 2;
-            const text = shortLabel(labels[i] || `${i + 1}`, useRotation ? 18 : 14);
-            if (useRotation) {
-              parts.push(`<text x="${x}" y="${plotBottomY + 12}" text-anchor="end" font-size="8" fill="#666" transform="rotate(-35, ${x}, ${plotBottomY + 12})">${escapeXml(text)}</text>`);
-            } else {
-              parts.push(`<text x="${x}" y="${plotBottomY + 16}" text-anchor="middle" font-size="9" fill="#666">${escapeXml(text)}</text>`);
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // Render axis titles from config (applies to all cartesian chart types)
-  if (chartType !== "pie" && chartType !== "doughnut" && chartType !== "heatmap") {
-    const xTitle = config.options?.scales?.x?.title;
-    if (xTitle?.display && xTitle?.text) {
-      const axisLabel = shortLabel(xTitle.text, 50);
-      parts.push(`<text x="${plotX + plotWidth / 2}" y="${plotBottomY + 52}" text-anchor="middle" font-size="11" fill="#444" font-weight="500">${escapeXml(axisLabel)}</text>`);
-    }
-    const yTitle = config.options?.scales?.y?.title;
-    if (yTitle?.display && yTitle?.text) {
-      const axisLabel = shortLabel(yTitle.text, 50);
-      parts.push(`<text x="${plotX - 46}" y="${plotY + plotHeight / 2}" text-anchor="middle" font-size="11" fill="#444" font-weight="500" transform="rotate(-90, ${plotX - 46}, ${plotY + plotHeight / 2})">${escapeXml(axisLabel)}</text>`);
-    }
-  }
-
-  // Shared legend for non-pie charts. Long variable names are common in survey and panel data,
-  // so the legend layout adapts instead of squeezing every series into three fixed columns.
-  const shouldDrawSharedLegend = config.options?.plugins?.legend?.display !== false;
-  if (shouldDrawSharedLegend && chartType !== "pie" && chartType !== "doughnut" && chartType !== "heatmap" && datasets.length > 0) {
-    const legendCount = Math.min(datasets.length, 6);
-    const legendRawLabels = datasets.slice(0, legendCount).map((item, i) => String(item?.label || `Dataset ${i + 1}`));
-    const longestLegendLabel = Math.max(...legendRawLabels.map(label => label.length));
-    const legendColumns = longestLegendLabel > 22 ? Math.min(2, legendCount) : Math.min(3, legendCount);
-    const legendRows = Math.ceil(legendCount / legendColumns);
-    const legendLineHeight = 15;
-    const legendStartY = height - 18 - (legendRows - 1) * legendLineHeight;
-    const legendCellW = plotWidth / legendColumns;
-    const legendMaxChars = Math.max(12, Math.min(30, Math.floor((legendCellW - 18) / 5.6)));
-    for (let i = 0; i < legendCount; i++) {
-      const row = Math.floor(i / legendColumns);
-      const col = i % legendColumns;
-      const x = plotX + col * legendCellW;
-      const y = legendStartY + row * legendLineHeight;
-      const color = pickColor(i, datasets[i]?.backgroundColor || datasets[i]?.borderColor);
-      const label = shortLabel(legendRawLabels[i], legendMaxChars);
-      parts.push(`<rect x="${x}" y="${y - 8}" width="9" height="9" fill="${color}"/>`);
-      parts.push(`<text x="${x + 13}" y="${y}" font-size="8.5" fill="#666">${escapeXml(label)}</text>`);
-    }
-  }
-
-  parts.push(`</svg>`);
-  return Buffer.from(parts.join(""), "utf-8");
+  const svg = renderChartSvg(config, width, height, {
+    labelTransform: (value: string) => ensureAsciiLabelSync(value, "Label"),
+  });
+  return Buffer.from(svg, "utf-8");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1559,6 +1065,25 @@ function buildAsciiColumnRenameMap(
     colMap.set(col, finalName);
   }
   return colMap;
+}
+
+/** Rewrites variable-role column references after columns were renamed. */
+export function remapAnalysisInputs(inputs: AnalysisInputs | undefined, renameLookup: Map<string, string>): AnalysisInputs | undefined {
+  if (!inputs || renameLookup.size === 0) return inputs;
+  const map = (value?: string) => {
+    if (!value) return value;
+    const trimmed = value.trim();
+    return renameLookup.get(trimmed) ?? renameLookup.get(value) ?? value;
+  };
+  return {
+    ...inputs,
+    outcome: map(inputs.outcome),
+    treatment: map(inputs.treatment),
+    entity: map(inputs.entity),
+    time: map(inputs.time),
+    subgroup: map(inputs.subgroup),
+    controls: inputs.controls?.map(control => map(control) || control),
+  };
 }
 
 function applyColumnRenameMap(
@@ -1795,7 +1320,7 @@ export async function executePythonExperiment(
   const startTime = Date.now();
   const deterministicPlan = parseDeterministicAnalysisPlan(analysisCode);
   const analysisTopic = typeof deterministicPlan?.topic === "string" ? deterministicPlan.topic : "";
-  const analysisInputs = deterministicPlan?.analysisInputs;
+  let analysisInputs = deterministicPlan?.analysisInputs;
   const planMethods = Array.isArray(deterministicPlan?.methods) ? deterministicPlan.methods : [];
   const workDir = path.join(os.tmpdir(), `experiment-${runId}-${nanoid(6)}`);
   const dataDir = path.join(workDir, "data");
@@ -2074,9 +1599,14 @@ export async function executePythonExperiment(
       }
       if (allColNames.length > 0) {
         const colTranslations = await translateLabelsToEnglish(allColNames);
+        const renameLookup = new Map<string, string>();
         for (const ds of allData) {
-          applyColumnRenameMap(ds, buildAsciiColumnRenameMap(ds.columns, colTranslations));
+          const renameMap = buildAsciiColumnRenameMap(ds.columns, colTranslations);
+          renameMap.forEach((renamed, original) => renameLookup.set(original, renamed));
+          applyColumnRenameMap(ds, renameMap);
         }
+        // Variable roles are specified with the original (possibly Japanese) names.
+        analysisInputs = remapAnalysisInputs(analysisInputs, renameLookup);
         await publishProgress(`[INFO] Translated ${allColNames.length} column names to English`, {
           phase: "translating_columns",
           persist: true,
@@ -2092,9 +1622,13 @@ export async function executePythonExperiment(
         phase: "translating_columns",
         persist: true,
       });
+      const renameLookup = new Map<string, string>();
       for (const ds of allData) {
-        applyColumnRenameMap(ds, buildAsciiColumnRenameMap(ds.columns));
+        const renameMap = buildAsciiColumnRenameMap(ds.columns);
+        renameMap.forEach((renamed, original) => renameLookup.set(original, renamed));
+        applyColumnRenameMap(ds, renameMap);
       }
+      analysisInputs = remapAnalysisInputs(analysisInputs, renameLookup);
     }
 
     // 2. ALWAYS generate charts/tables/metrics from REAL DATA
@@ -2200,12 +1734,14 @@ export async function executePythonExperiment(
           }
         }
         if (/[^\x00-\x7F]/.test(t.description)) nonAsciiSet.add(t.description);
+        if (t.notes && /[^\x00-\x7F]/.test(t.notes)) nonAsciiSet.add(t.notes);
       }
       for (const key of Object.keys(metrics)) {
         if (/[^\x00-\x7F]/.test(key)) nonAsciiSet.add(key);
       }
       for (const cd of chartDefinitions) {
         if (/[^\x00-\x7F]/.test(cd.description)) nonAsciiSet.add(cd.description);
+        if (cd.caption && /[^\x00-\x7F]/.test(cd.caption)) nonAsciiSet.add(cd.caption);
       }
 
       if (nonAsciiSet.size > 0) {
@@ -2219,6 +1755,7 @@ export async function executePythonExperiment(
             typeof cell === "string" && /[^\x00-\x7F]/.test(cell) ? tr(cell) : cell
           ));
           if (/[^\x00-\x7F]/.test(t.description)) t.description = tr(t.description);
+          if (t.notes && /[^\x00-\x7F]/.test(t.notes)) t.notes = tr(t.notes);
         }
 
         // Apply to metric keys
@@ -2234,6 +1771,7 @@ export async function executePythonExperiment(
         // Apply to chart descriptions
         for (const cd of chartDefinitions) {
           if (/[^\x00-\x7F]/.test(cd.description)) cd.description = tr(cd.description);
+          if (cd.caption && /[^\x00-\x7F]/.test(cd.caption)) cd.caption = tr(cd.caption);
         }
 
         await publishProgress(`[INFO] Translated ${nonAsciiSet.size} non-ASCII labels in tables/metrics/charts`, {
@@ -2251,6 +1789,7 @@ export async function executePythonExperiment(
         t.headers = t.headers.map(h => typeof h === "string" ? tr(h) : String(h));
         t.rows = t.rows.map(row => row.map(cell => typeof cell === "string" ? tr(cell) : cell));
         t.description = tr(t.description);
+        if (t.notes) t.notes = tr(t.notes);
       }
       const fallbackMetrics: Record<string, number | string> = {};
       for (const [key, val] of Object.entries(metrics)) {
@@ -2260,6 +1799,7 @@ export async function executePythonExperiment(
       Object.assign(metrics, fallbackMetrics);
       for (const cd of chartDefinitions) {
         cd.description = tr(cd.description);
+        if (cd.caption) cd.caption = tr(cd.caption);
       }
     }
 
@@ -2313,8 +1853,8 @@ export async function executePythonExperiment(
 
         const pngBuffer = await renderChartToPng(
           configStr,
-          (chartDef as any).width || 800,
-          (chartDef as any).height || 500
+          chartDef.width || 900,
+          chartDef.height || 560
         );
 
         // Determine content type based on buffer content
@@ -2332,6 +1872,8 @@ export async function executePythonExperiment(
           fileKey: chartKey,
           mimeType: contentType,
           format,
+          caption: chartDef.caption,
+          section: chartDef.section,
         });
         await publishProgress(`[CHART] Generated: ${chartDef.name} (${(pngBuffer.length / 1024).toFixed(1)} KiB, ${ext})`, {
           phase: "rendering_charts",
@@ -2367,6 +1909,10 @@ export async function executePythonExperiment(
           url,
           description: tableDef.description || tableDef.name,
           data: `${headerRow}\n${dataRows.split("\n").slice(0, 20).join("\n")}`,
+          headers: tableDef.headers.map(h => String(h)),
+          rows: tableDef.rows.slice(0, 60),
+          notes: tableDef.notes,
+          section: tableDef.section,
         });
         await publishProgress(`[TABLE] Generated: ${tableDef.name} (${tableDef.rows.length} rows)`, {
           phase: "processing_tables",
@@ -2477,6 +2023,7 @@ export function isIdOrCodeColumn(col: string, data: Record<string, any>[]): bool
   // Statistical detection: check if values are sequential integers with very high cardinality
   const sampleSize = Math.min(data.length, 200);
   const values = data.slice(0, sampleSize)
+    .filter(r => !isMissingValue(r[col]))
     .map(r => Number(r[col]))
     .filter(v => !isNaN(v) && Number.isInteger(v));
   if (values.length < 10) return false;
@@ -2515,6 +2062,7 @@ function isLowCardinalityNumericCategory(col: string, data: Record<string, any>[
   const nameLooksCategorical = categoryNamePatterns.some(pattern => lowerCol.includes(pattern));
   const nameLooksContinuous = continuousNamePatterns.some(pattern => lowerCol.includes(pattern));
   const values = data.slice(0, Math.min(data.length, 500))
+    .filter(row => !isMissingValue(row[col]))
     .map(row => Number(row[col]))
     .filter(value => Number.isFinite(value));
   if (values.length < 20) return false;
@@ -2601,9 +2149,11 @@ function metricKeyPart(input: string, maxLen = 24): string {
 function parseNumericPairs(ds: ParsedDataset, xCol: string, yCol: string): [number, number][] {
   const pairs: [number, number][] = [];
   for (const row of ds.data) {
+    // Number(null) and Number("") are 0, so missing cells must be skipped explicitly.
+    if (isMissingValue(row[xCol]) || isMissingValue(row[yCol])) continue;
     const x = Number(row[xCol]);
     const y = Number(row[yCol]);
-    if (!isNaN(x) && !isNaN(y)) pairs.push([x, y]);
+    if (Number.isFinite(x) && Number.isFinite(y)) pairs.push([x, y]);
   }
   return pairs;
 }
@@ -2611,6 +2161,7 @@ function parseNumericPairs(ds: ParsedDataset, xCol: string, yCol: string): [numb
 function getFiniteNumericValues(ds: ParsedDataset, col: string, limit = 2500): number[] {
   const values: number[] = [];
   for (const row of ds.data) {
+    if (isMissingValue(row[col])) continue;
     const value = Number(row[col]);
     if (!isNaN(value) && isFinite(value)) values.push(value);
     if (values.length >= limit) break;
@@ -2707,30 +2258,106 @@ function approximateCorrelationPValue(r: number, n: number): number {
   return approxTwoTailPValue(t, df);
 }
 
+function logGamma(x: number): number {
+  // Lanczos approximation (g = 7, n = 9)
+  const coefficients = [
+    0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313,
+    -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6,
+    1.5056327351493116e-7,
+  ];
+  if (x < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * x)) - logGamma(1 - x);
+  const z = x - 1;
+  let sum = coefficients[0];
+  for (let i = 1; i < 9; i++) sum += coefficients[i] / (z + i);
+  const t = z + 7.5;
+  return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(sum);
+}
+
+function incompleteBetaContinuedFraction(a: number, b: number, x: number): number {
+  const maxIterations = 300;
+  const epsilon = 3e-14;
+  const tiny = 1e-300;
+  let c = 1;
+  let d = 1 - ((a + b) * x) / (a + 1);
+  if (Math.abs(d) < tiny) d = tiny;
+  d = 1 / d;
+  let h = d;
+  for (let m = 1; m <= maxIterations; m++) {
+    const m2 = 2 * m;
+    let aa = (m * (b - m) * x) / ((a + m2 - 1) * (a + m2));
+    d = 1 + aa * d;
+    if (Math.abs(d) < tiny) d = tiny;
+    c = 1 + aa / c;
+    if (Math.abs(c) < tiny) c = tiny;
+    d = 1 / d;
+    h *= d * c;
+    aa = (-(a + m) * (a + b + m) * x) / ((a + m2) * (a + m2 + 1));
+    d = 1 + aa * d;
+    if (Math.abs(d) < tiny) d = tiny;
+    c = 1 + aa / c;
+    if (Math.abs(c) < tiny) c = tiny;
+    d = 1 / d;
+    const delta = d * c;
+    h *= delta;
+    if (Math.abs(delta - 1) < epsilon) break;
+  }
+  return h;
+}
+
+/** Regularised incomplete beta function I_x(a, b). */
+export function regularizedIncompleteBeta(x: number, a: number, b: number): number {
+  if (!(x > 0)) return 0;
+  if (x >= 1) return 1;
+  const logFront = logGamma(a + b) - logGamma(a) - logGamma(b) + a * Math.log(x) + b * Math.log(1 - x);
+  const front = Math.exp(logFront);
+  if (x < (a + 1) / (a + b + 2)) {
+    return front * incompleteBetaContinuedFraction(a, b, x) / a;
+  }
+  return 1 - (front * incompleteBetaContinuedFraction(b, a, 1 - x)) / b;
+}
+
+/** Exact two-tailed p-value of a Student-t statistic. */
+export function studentTTwoTailPValue(t: number, df: number): number {
+  if (!Number.isFinite(t)) return Number.isNaN(t) ? 1 : 0;
+  if (!(df > 0)) return 1;
+  const p = regularizedIncompleteBeta(df / (df + t * t), df / 2, 0.5);
+  return Math.min(1, Math.max(0, p));
+}
+
+/** Upper-tail p-value of an F statistic with (d1, d2) degrees of freedom. */
+export function fDistributionPValue(f: number, d1: number, d2: number): number {
+  if (!(f > 0) || !(d1 > 0) || !(d2 > 0)) return 1;
+  if (!Number.isFinite(f)) return 0;
+  const p = regularizedIncompleteBeta(d2 / (d2 + d1 * f), d2 / 2, d1 / 2);
+  return Math.min(1, Math.max(0, p));
+}
+
+const tCriticalCache = new Map<number, number>();
+
+/** Two-sided critical value of Student's t (default 95% confidence). */
+export function studentTCritical(df: number, alpha = 0.05): number {
+  if (!(df > 0)) return 1.96;
+  const key = Math.round(df * 1000) / 1000 + alpha * 1e6;
+  const cached = tCriticalCache.get(key);
+  if (cached !== undefined) return cached;
+  let lo = 0;
+  let hi = 1000;
+  for (let i = 0; i < 80; i++) {
+    const mid = (lo + hi) / 2;
+    if (studentTTwoTailPValue(mid, df) > alpha) lo = mid;
+    else hi = mid;
+  }
+  const value = (lo + hi) / 2;
+  tCriticalCache.set(key, value);
+  return value;
+}
+
 /**
- * Approximate two-tailed p-value for a t-statistic with given degrees of freedom.
- * For df > 30, uses a normal approximation via the Abramowitz & Stegun formula.
- * For smaller df, uses conservative threshold-based estimation.
+ * Two-tailed p-value for a t-statistic with given degrees of freedom
+ * (exact Student-t distribution via the regularised incomplete beta function).
  */
 function approxTwoTailPValue(t: number, df: number): number {
-  const absT = Math.abs(t);
-  if (df > 30) {
-    // Normal approximation: P(Z > |t|) using A&S 26.2.17
-    const z = absT;
-    const p = 0.2316419;
-    const b1 = 0.319381530, b2 = -0.356563782, b3 = 1.781477937, b4 = -1.821255978, b5 = 1.330274429;
-    const tVal = 1 / (1 + p * z);
-    const phi = Math.exp(-z * z / 2) / Math.sqrt(2 * Math.PI);
-    const oneTail = phi * (b1 * tVal + b2 * tVal ** 2 + b3 * tVal ** 3 + b4 * tVal ** 4 + b5 * tVal ** 5);
-    return Math.min(1, Math.max(0, 2 * oneTail));
-  }
-  // Small sample: conservative thresholds
-  if (absT > 3.291) return 0.005;
-  if (absT > 2.576) return 0.01;
-  if (absT > 1.96) return 0.05;
-  if (absT > 1.645) return 0.1;
-  if (absT > 1.282) return 0.2;
-  return 0.5;
+  return studentTTwoTailPValue(t, df);
 }
 
 function regressionStatsFromPairs(pairs: [number, number][]): {
@@ -2913,6 +2540,8 @@ interface EconometricDesignHints {
   primaryInstrumentCol?: string;
   primaryRunningCol?: string;
   subgroupCol?: string;
+  /** True when controls were chosen automatically because none were specified. */
+  controlsAutoSelected?: boolean;
 }
 
 type MissingDataMode = "complete_case" | "mean_imputation";
@@ -3169,7 +2798,30 @@ interface QuantileRegressionResult {
 }
 
 function detectTimeColumnsFromDataset(ds: ParsedDataset): string[] {
-  return ds.columns.filter(c => /(year|month|date|time|wave|period|quarter)/i.test(c));
+  const byName = ds.columns.filter(c =>
+    /(year|month|date|time|wave|period|quarter|fiscal|round)/i.test(c) &&
+    // Durations and counts are measures, not time indices.
+    !/(duration|spent|minute|hour|second|commute|elapsed|times_|_times|overtime|lifetime|full[_ ]?time|part[_ ]?time)/i.test(c),
+  );
+  const byValue = ds.columns.filter(c => !byName.includes(c) && looksLikeTimeValues(ds, c));
+  return [...byName, ...byValue];
+}
+
+/** Year-valued integers or date strings, recognised independently of the column name. */
+function looksLikeTimeValues(ds: ParsedDataset, col: string): boolean {
+  const sample = sampleDistinctValues(ds, col, 300);
+  if (sample.length < 3) return false;
+  const numeric = sample.map(Number).filter(Number.isFinite);
+  if (numeric.length === sample.length) {
+    return sample.length <= 150 && numeric.every(v => Number.isInteger(v) && v >= 1900 && v <= 2100);
+  }
+  const dateLike = sample.filter(v =>
+    /^\d{4}[-/.年]\s*\d{1,2}(?:[-/.月]\s*\d{1,2}日?)?/.test(v) ||
+    /^\d{1,2}[-/.]\d{1,2}[-/.]\d{4}$/.test(v) ||
+    /^\d{4}-\d{2}-\d{2}T/.test(v) ||
+    /^\d{4}\s*[-_]?\s*(?:q|Q)[1-4]$/.test(v),
+  ).length;
+  return dateLike / sample.length >= 0.9;
 }
 
 function detectEntityColumns(ds: ParsedDataset, categoricalCols: string[], idCols: string[]): string[] {
@@ -3194,11 +2846,13 @@ function detectTreatmentColumns(ds: ParsedDataset, numericCols: string[], catego
     let score = 0;
     if (/(treat|treatment|intervention|policy|program|exposure|assignment|eligible|eligibility|shock|reform|law|mandate|subsidy|grant|random|lottery)/i.test(normalized)) score += 6;
     if (/(post|after|treated|did|difference)/i.test(normalized)) score += 2;
-    if (isBinaryLikeColumn(ds, col)) score += 3;
+    // Binary coding strengthens a treatment-like name but is not enough on its own
+    // (sex, marital status or survey flags are not interventions).
+    if (isBinaryLikeColumn(ds, col)) score += score > 0 ? 3 : 1;
     // Variables that look like outcomes should not become treatments merely because they are binary.
     if (/(outcome|target|response|score|rate|risk|income|wage|earnings|salary|price|cost|value|performance|sales|mortality|health|mental|depress|anxiety|stress|wellbeing|happiness|satisfaction|employment|unemployment|hours|productivity|ghq|phq|gad|k6|k10|cesd|who5|sf12|sf36)/i.test(normalized)) score -= 5;
     if (/(id|code|index|year|month|wave|date|time)/i.test(normalized)) score -= 3;
-    if (score > 0) scored.set(col, Math.max(score, scored.get(col) || 0));
+    if (score >= 3) scored.set(col, Math.max(score, scored.get(col) || 0));
   }
   return Array.from(scored.entries())
     .sort((a, b) => b[1] - a[1])
@@ -3229,10 +2883,12 @@ function scoreTopicAlignment(columnName: string, topicKeywords: string[]): numbe
   const normalized = columnName.toLowerCase().replace(/[^a-z0-9]+/g, " ");
   let score = 0;
   for (const keyword of topicKeywords) {
-    if (normalized.includes(keyword)) score += keyword.length >= 7 ? 3 : 2;
-    if (keyword.startsWith("mental") && /(mental|depress|anxiety|stress|distress|wellbeing|well being|health|happiness|satisfaction|ghq|phq|gad|k6|k10|cesd|who5|sf12|sf36)/i.test(normalized)) score += 3;
-    if (keyword.startsWith("health") && /(health|ghq|phq|gad|k6|k10|cesd|who5|sf12|sf36)/i.test(normalized)) score += 3;
-    if (/(labou?r|employment|job|wage|income|earnings|salary|hours|unemployment)/i.test(keyword) && /(employment|job|wage|income|earnings|salary|hours|unemployment|labou?r)/i.test(normalized)) score += 3;
+    // A topic word appearing verbatim in the column name is the strongest signal;
+    // domain associations (e.g. "mental" -> ghq) are weaker hints.
+    if (normalized.includes(keyword)) score += keyword.length >= 7 ? 5 : 3;
+    if (keyword.startsWith("mental") && /(mental|depress|anxiety|stress|distress|wellbeing|well being|health|happiness|satisfaction|ghq|phq|gad|k6|k10|cesd|who5|sf12|sf36)/i.test(normalized)) score += 2;
+    if (keyword.startsWith("health") && /(health|ghq|phq|gad|k6|k10|cesd|who5|sf12|sf36)/i.test(normalized)) score += 2;
+    if (/(labou?r|employment|job|wage|income|earnings|salary|hours|unemployment)/i.test(keyword) && /(employment|job|wage|income|earnings|salary|hours|unemployment|labou?r)/i.test(normalized)) score += 2;
   }
   return score;
 }
@@ -3284,11 +2940,12 @@ function inferEconometricDesignHints(
     treatmentCols.find(col => col !== primaryOutcomeCol && col !== primaryInstrumentCol) ||
     treatmentCols.find(col => col !== primaryOutcomeCol) ||
     treatmentCols[0];
+  const primaryEntityCol = entityCols.find(col => columnRepeatsAcrossRows(ds, col));
   const primaryRegressorCol =
     (primaryTreatmentCol && primaryTreatmentCol !== primaryOutcomeCol ? primaryTreatmentCol : undefined) ||
-    numericCols.find(col => col !== primaryOutcomeCol && !outcomeCols.includes(col));
+    chooseFallbackRegressor(ds, numericCols, primaryOutcomeCol, new Set(uniqueDefinedColumns([primaryOutcomeCol, primaryEntityCol, ...timeCols, ...idCols])), topic);
 
-  return mergeAnalysisInputsIntoDesignHints(ds, {
+  const merged = mergeAnalysisInputsIntoDesignHints(ds, {
     timeCols,
     entityCols,
     treatmentCols,
@@ -3299,13 +2956,105 @@ function inferEconometricDesignHints(
     specifiedInputMatches: [],
     specifiedInputMissing: [],
     primaryTimeCol: timeCols[0],
-    primaryEntityCol: entityCols[0],
+    primaryEntityCol,
     primaryTreatmentCol,
     primaryOutcomeCol,
     primaryRegressorCol,
     primaryInstrumentCol,
     primaryRunningCol: runningCols[0],
   }, analysisInputs);
+
+  // Without user-specified controls, adjust for a small set of plausible covariates so the
+  // headline model is a multivariable specification rather than a bivariate association.
+  if (!analysisInputs?.controls || analysisInputs.controls.length === 0) {
+    const autoControls = autoSelectControls(ds, numericCols, categoricalCols, idCols, merged, topic);
+    if (autoControls.length > 0) {
+      merged.controlCols = autoControls;
+      merged.controlsAutoSelected = true;
+    }
+  }
+  return merged;
+}
+
+/** True when a candidate unit identifier actually repeats (panel / clustered structure). */
+function columnRepeatsAcrossRows(ds: ParsedDataset, col: string): boolean {
+  const sample = ds.data.slice(0, 20000);
+  const seen = new Set<string>();
+  let nonMissing = 0;
+  for (const row of sample) {
+    const key = categoryKey(row[col]);
+    if (key === null) continue;
+    nonMissing++;
+    seen.add(key);
+  }
+  return nonMissing > 0 && seen.size >= 8 && seen.size <= nonMissing * 0.8;
+}
+
+function chooseFallbackRegressor(
+  ds: ParsedDataset,
+  numericCols: string[],
+  outcomeCol: string | undefined,
+  exclude: Set<string>,
+  topic?: string,
+): string | undefined {
+  if (!outcomeCol) return undefined;
+  const keywords = extractTopicKeywords(topic);
+  let best: { col: string; score: number } | undefined;
+  for (const col of numericCols) {
+    if (col === outcomeCol || exclude.has(col) || isPathologicalNumericColumn(ds, col)) continue;
+    if (/(^id$|_id$|id_|code|index|^wave$|^year$|month|date)/i.test(col)) continue;
+    const corr = pearsonFromPairs(parseNumericPairs(ds, col, outcomeCol));
+    if (!corr) continue;
+    // Near-duplicates of the outcome (transformations, components) are not explanatory variables.
+    if (Math.abs(corr.r) > 0.95) continue;
+    const score = Math.abs(corr.r) + 0.08 * scoreTopicAlignment(col, keywords);
+    if (!best || score > best.score) best = { col, score };
+  }
+  return best?.col;
+}
+
+function autoSelectControls(
+  ds: ParsedDataset,
+  numericCols: string[],
+  categoricalCols: string[],
+  idCols: string[],
+  hints: EconometricDesignHints,
+  topic?: string,
+): string[] {
+  const outcome = hints.primaryOutcomeCol;
+  const regressor = hints.primaryRegressorCol;
+  if (!outcome || !regressor) return [];
+  const blocked = new Set(uniqueDefinedColumns([
+    outcome, regressor, hints.primaryEntityCol, hints.primaryTimeCol, hints.primaryInstrumentCol, hints.primaryRunningCol,
+    ...hints.timeCols, ...idCols,
+  ]));
+  const rowCount = Math.max(1, ds.data.length);
+  const missingShare = (col: string) => ds.data.reduce((sum, row) => sum + (isMissingValue(row[col]) ? 1 : 0), 0) / rowCount;
+  const keywords = extractTopicKeywords(topic);
+  const numericCandidates: Array<{ col: string; score: number }> = [];
+  for (const col of numericCols) {
+    if (blocked.has(col) || isPathologicalNumericColumn(ds, col)) continue;
+    if (/(^id$|_id$|code|index)/i.test(col)) continue;
+    if (missingShare(col) > 0.3) continue;
+    const withRegressor = pearsonFromPairs(parseNumericPairs(ds, col, regressor));
+    const withOutcome = pearsonFromPairs(parseNumericPairs(ds, col, outcome));
+    if (!withOutcome) continue;
+    if (withRegressor && Math.abs(withRegressor.r) > 0.9) continue;
+    if (Math.abs(withOutcome.r) > 0.95) continue;
+    let score = 1;
+    if (/(age|sex|gender|female|male|educ|school|income|earn|wage|size|married|marital|child|household|experience|tenure|urban|rural|region)/i.test(col)) score += 2;
+    score += 0.2 * scoreTopicAlignment(col, keywords);
+    numericCandidates.push({ col, score });
+  }
+  const numericPick = numericCandidates.sort((a, b) => b.score - a.score).slice(0, 4).map(item => item.col);
+  const categoricalPick: string[] = [];
+  for (const col of categoricalCols) {
+    if (blocked.has(col) || numericCols.includes(col) || categoricalPick.length >= 2) continue;
+    if (averageTextLength(ds, col) > 40 || missingShare(col) > 0.3) continue;
+    const levels = categoryCounts(ds, col).size;
+    if (levels >= 2 && levels <= 8) categoricalPick.push(col);
+  }
+  return [...numericPick, ...categoricalPick];
 }
 
 function invert2x2(a: number, b: number, c: number, d: number): [number, number, number, number] | null {
@@ -3679,6 +3428,39 @@ function uniqueColumns(columns: Array<string | undefined>): string[] {
   return Array.from(new Set(columns.filter((column): column is string => Boolean(column))));
 }
 
+const DUMMY_LEVEL_SEPARATOR = " = ";
+const dummySpecsByDataset = new WeakMap<ParsedDataset, Map<string, { source: string; level: string }>>();
+
+/**
+ * Expands a categorical column into indicator columns (reference = most frequent level).
+ * Returns the synthetic column names, or [] when the column is not a usable categorical.
+ */
+function expandCategoricalToDummies(ds: ParsedDataset, col: string, maxLevels = 12): string[] {
+  const counts = Array.from(categoryCounts(ds, col).entries()).sort((a, b) => b[1] - a[1]);
+  if (counts.length < 2 || counts.length > maxLevels) return [];
+  const specs = dummySpecsByDataset.get(ds) || new Map<string, { source: string; level: string }>();
+  dummySpecsByDataset.set(ds, specs);
+  const names: string[] = [];
+  for (const [level, count] of counts.slice(1)) {
+    if (count < 5) continue;
+    const name = `${col}${DUMMY_LEVEL_SEPARATOR}${level}`;
+    specs.set(name, { source: col, level });
+    names.push(name);
+  }
+  return names;
+}
+
+/** Numeric value of a (possibly synthetic dummy) regressor for one row. */
+function regressorValue(ds: ParsedDataset, row: Record<string, any>, column: string): number | null {
+  const spec = dummySpecsByDataset.get(ds)?.get(column);
+  if (spec) {
+    const key = categoryKey(row[spec.source]);
+    if (key === null) return null;
+    return key === spec.level ? 1 : 0;
+  }
+  return coerceRegressionValue(row[column]);
+}
+
 function resolveModelRegressorColumns(
   ds: ParsedDataset,
   hints: EconometricDesignHints,
@@ -3689,13 +3471,29 @@ function resolveModelRegressorColumns(
   omittedControlCols: string[];
 } {
   const yCol = hints.primaryOutcomeCol;
-  const primaryRegressorCol = hints.primaryRegressorCol && hints.primaryRegressorCol !== yCol
+  let primaryRegressorCol = hints.primaryRegressorCol && hints.primaryRegressorCol !== yCol
     ? hints.primaryRegressorCol
     : undefined;
+  const extraContrasts: string[] = [];
+  if (primaryRegressorCol && !isRegressionCompatibleColumn(ds, primaryRegressorCol)) {
+    // Categorical key variable: use indicator contrasts against the most common level.
+    const dummies = expandCategoricalToDummies(ds, primaryRegressorCol);
+    primaryRegressorCol = dummies[0];
+    extraContrasts.push(...dummies.slice(1));
+  }
   const candidateControls = uniqueColumns(hints.controlCols)
-    .filter(column => column !== yCol && column !== primaryRegressorCol);
-  const controlCols = candidateControls.filter(column => isRegressionCompatibleColumn(ds, column));
-  const omittedControlCols = candidateControls.filter(column => !controlCols.includes(column));
+    .filter(column => column !== yCol && column !== hints.primaryRegressorCol && column !== primaryRegressorCol);
+  const controlCols: string[] = [...extraContrasts];
+  const omittedControlCols: string[] = [];
+  for (const column of candidateControls) {
+    if (isRegressionCompatibleColumn(ds, column)) {
+      controlCols.push(column);
+      continue;
+    }
+    const dummies = averageTextLength(ds, column) <= 40 ? expandCategoricalToDummies(ds, column) : [];
+    if (dummies.length > 0) controlCols.push(...dummies);
+    else omittedControlCols.push(column);
+  }
   return {
     primaryRegressorCol,
     regressorCols: uniqueColumns([primaryRegressorCol, ...controlCols]),
@@ -3708,7 +3506,7 @@ function buildPredictorMeans(ds: ParsedDataset, regressorCols: string[]): Map<st
   const means = new Map<string, number>();
   for (const column of regressorCols) {
     const values = ds.data
-      .map(row => coerceRegressionValue(row[column]))
+      .map(row => regressorValue(ds, row, column))
       .filter((value): value is number => value !== null);
     if (values.length > 0) {
       means.set(column, mean(values));
@@ -3744,7 +3542,7 @@ function prepareRegressionData(
     const predictors: number[] = [];
     let invalid = false;
     for (const column of regressorCols) {
-      let value = coerceRegressionValue(row[column]);
+      let value = regressorValue(ds, row, column);
       if (value === null) {
         if (missingDataMode === "mean_imputation" && predictorMeans.has(column)) {
           value = predictorMeans.get(column)!;
@@ -3814,7 +3612,7 @@ function preparePanelRegressionData(
     const predictors: number[] = [];
     let invalid = false;
     for (const column of regressorCols) {
-      let value = coerceRegressionValue(row[column]);
+      let value = regressorValue(ds, row, column);
       if (value === null) {
         if (missingDataMode === "mean_imputation" && predictorMeans.has(column)) {
           value = predictorMeans.get(column)!;
@@ -3991,8 +3789,9 @@ function fitLinearModel(observations: PreparedRegressionRow[]): LinearModelFit |
     : Math.max(1, n - parameterCount);
   const tStats = coefficients.map((coefficient, index) => standardErrors[index] > 0 ? coefficient / standardErrors[index] : 0);
   const pValues = tStats.map(tStat => approxTwoTailPValue(tStat, degreesOfFreedom));
-  const ciLower = coefficients.map((coefficient, index) => coefficient - 1.96 * standardErrors[index]);
-  const ciUpper = coefficients.map((coefficient, index) => coefficient + 1.96 * standardErrors[index]);
+  const criticalValue = studentTCritical(degreesOfFreedom);
+  const ciLower = coefficients.map((coefficient, index) => coefficient - criticalValue * standardErrors[index]);
+  const ciUpper = coefficients.map((coefficient, index) => coefficient + criticalValue * standardErrors[index]);
 
   return {
     coefficients,
@@ -5589,1045 +5388,954 @@ function getPrimaryDataset(allData: ParsedDataset[]): ParsedDataset | null {
   return best || allData[0];
 }
 
+/* ------------------------------------------------------------------ */
+/*  Figure planning helpers                                            */
+/* ------------------------------------------------------------------ */
+
+export type FigureSection = "descriptive" | "main" | "diagnostic";
+
+export interface ChartDefinition {
+  name: string;
+  /** Short description used in logs and prompts. */
+  description: string;
+  /** Publication caption (what is shown, sample, uncertainty). */
+  caption?: string;
+  section?: FigureSection;
+  config: any;
+  width?: number;
+  height?: number;
+}
+
+export interface TableDefinition {
+  name: string;
+  description: string;
+  headers: string[];
+  rows: (string | number)[][];
+  /** Table notes printed under the table (significance legend, sample notes). */
+  notes?: string;
+  section?: "descriptive" | "main" | "diagnostic" | "appendix" | "methods";
+}
+
+const FIGURE_COLORS = {
+  primary: "#2a78d6",
+  secondary: "#eb6834",
+  tertiary: "#1baf7a",
+  quaternary: "#eda100",
+  accent: "#e34948",
+  violet: "#4a3aa7",
+  neutral: "#9a9890",
+};
+const SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"];
+
+/** Rounds to significant digits (fixed-decimal rounding would turn 1e-5 coefficients into 0). */
+function roundSig(value: number, digits = 5): number {
+  if (!Number.isFinite(value) || value === 0) return 0;
+  return Number(value.toPrecision(digits));
+}
+
+function displayName(col: string, max = 36): string {
+  const text = String(col ?? "");
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+function formatNumber(value: number): string {
+  if (!Number.isFinite(value)) return "NA";
+  const abs = Math.abs(value);
+  if (abs >= 1e6) return value.toExponential(2);
+  if (abs >= 1000) return value.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  if (abs >= 100) return value.toFixed(1);
+  if (abs >= 1) return value.toFixed(2);
+  if (abs === 0) return "0";
+  if (abs < 0.001) return value.toExponential(2);
+  return value.toFixed(3);
+}
+
+function formatCount(value: number): string {
+  return Math.round(value).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+function formatPValue(p: number): string {
+  if (!Number.isFinite(p)) return "NA";
+  if (p < 0.001) return "< 0.001";
+  return p.toFixed(3);
+}
+
+function significanceStars(p: number): string {
+  if (!Number.isFinite(p)) return "";
+  if (p < 0.001) return "***";
+  if (p < 0.01) return "**";
+  if (p < 0.05) return "*";
+  return "";
+}
+
+function numericValuesOf(ds: ParsedDataset, col: string, limit = Number.POSITIVE_INFINITY): number[] {
+  const values: number[] = [];
+  for (const row of ds.data) {
+    const raw = row[col];
+    if (isMissingValue(raw)) continue;
+    const value = typeof raw === "number" ? raw : Number(raw);
+    if (Number.isFinite(value)) values.push(value);
+    if (values.length >= limit) break;
+  }
+  return values;
+}
+
+function sortedQuantile(sorted: number[], p: number): number {
+  if (sorted.length === 0) return NaN;
+  if (sorted.length === 1) return sorted[0];
+  const position = (sorted.length - 1) * Math.max(0, Math.min(1, p));
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) return sorted[lower];
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
+}
+
+interface NumericSummary {
+  n: number;
+  mean: number;
+  sd: number;
+  min: number;
+  q1: number;
+  median: number;
+  q3: number;
+  max: number;
+}
+
+function summariseValues(values: number[]): NumericSummary | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const n = sorted.length;
+  const m = sorted.reduce((sum, v) => sum + v, 0) / n;
+  const sd = n > 1 ? Math.sqrt(sorted.reduce((sum, v) => sum + (v - m) ** 2, 0) / (n - 1)) : 0;
+  return {
+    n,
+    mean: m,
+    sd,
+    min: sorted[0],
+    q1: sortedQuantile(sorted, 0.25),
+    median: sortedQuantile(sorted, 0.5),
+    q3: sortedQuantile(sorted, 0.75),
+    max: sorted[n - 1],
+  };
+}
+
+function meanConfidenceInterval(values: number[]): { mean: number; low: number; high: number; n: number; sd: number } | null {
+  const n = values.length;
+  if (n === 0) return null;
+  const m = values.reduce((sum, v) => sum + v, 0) / n;
+  if (n < 2) return { mean: m, low: m, high: m, n, sd: 0 };
+  const sd = Math.sqrt(values.reduce((sum, v) => sum + (v - m) ** 2, 0) / (n - 1));
+  const half = studentTCritical(n - 1) * sd / Math.sqrt(n);
+  return { mean: m, low: m - half, high: m + half, n, sd };
+}
+
+function pearsonFromPairs(pairs: [number, number][]): { r: number; n: number; p: number } | null {
+  const n = pairs.length;
+  if (n < 4) return null;
+  let sx = 0, sy = 0;
+  for (const [x, y] of pairs) { sx += x; sy += y; }
+  const mx = sx / n;
+  const my = sy / n;
+  let cov = 0, vx = 0, vy = 0;
+  for (const [x, y] of pairs) {
+    cov += (x - mx) * (y - my);
+    vx += (x - mx) ** 2;
+    vy += (y - my) ** 2;
+  }
+  if (vx <= 0 || vy <= 0) return null;
+  const r = Math.max(-1, Math.min(1, cov / Math.sqrt(vx * vy)));
+  const t = Math.abs(r) >= 1 ? Infinity : r * Math.sqrt((n - 2) / (1 - r * r));
+  return { r, n, p: studentTTwoTailPValue(t, n - 2) };
+}
+
+function distinctNumericCount(ds: ParsedDataset, col: string, sample = 3000): number {
+  return new Set(numericValuesOf(ds, col, sample)).size;
+}
+
+function isContinuousColumn(ds: ParsedDataset, col: string): boolean {
+  return distinctNumericCount(ds, col) > 10;
+}
+
+function categoryKey(raw: unknown): string | null {
+  if (isMissingValue(raw)) return null;
+  const text = String(raw).trim();
+  return text ? text.slice(0, 40) : null;
+}
+
+function groupNumericValues(ds: ParsedDataset, groupCol: string, valueCol: string): Map<string, number[]> {
+  const groups = new Map<string, number[]>();
+  for (const row of ds.data) {
+    const key = categoryKey(row[groupCol]);
+    if (key === null) continue;
+    const raw = row[valueCol];
+    if (isMissingValue(raw)) continue;
+    const value = typeof raw === "number" ? raw : Number(raw);
+    if (!Number.isFinite(value)) continue;
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(value);
+    else groups.set(key, [value]);
+  }
+  return groups;
+}
+
+function orderCategoryKeys(keys: string[], sizeOf: (key: string) => number): string[] {
+  const allNumeric = keys.length > 0 && keys.every(key => key !== "" && Number.isFinite(Number(key)));
+  if (allNumeric) return [...keys].sort((a, b) => Number(a) - Number(b));
+  return [...keys].sort((a, b) => sizeOf(b) - sizeOf(a) || a.localeCompare(b));
+}
+
+function categoryCounts(ds: ParsedDataset, col: string): Map<string, number> {
+  const fromProfile = ds.fullDataProfile?.categorical?.[col];
+  const counts = new Map<string, number>();
+  if (fromProfile && Object.keys(fromProfile).length > 0) {
+    for (const [key, count] of Object.entries(fromProfile)) counts.set(key.slice(0, 40), (counts.get(key.slice(0, 40)) || 0) + count);
+    return counts;
+  }
+  for (const row of ds.data) {
+    const key = categoryKey(row[col]);
+    if (key === null) continue;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return counts;
+}
+
+function averageTextLength(ds: ParsedDataset, col: string): number {
+  const values = ds.data.slice(0, 300).map(row => row[col]).filter(v => typeof v === "string") as string[];
+  if (values.length === 0) return 0;
+  return values.reduce((sum, v) => sum + v.length, 0) / values.length;
+}
+
+/**
+ * Picks the categorical variable that best serves as a comparison grouping:
+ * user-specified subgroup, then a binary treatment, then a meaningfully named
+ * categorical with a handful of reasonably balanced levels.
+ */
+function chooseGroupingColumn(ds: ParsedDataset, bundle: AnalysisComputationBundle, exclude: Array<string | undefined> = [], topic = ""): string | undefined {
+  const topicKeywords = extractTopicKeywords(topic);
+  const hints = bundle.designHints;
+  const blocked = new Set(
+    [hints.primaryOutcomeCol, hints.primaryEntityCol, hints.primaryTimeCol, ...hints.timeCols, ...exclude]
+      .filter((c): c is string => Boolean(c)),
+  );
+  const levelInfo = (col: string) => {
+    const counts = categoryCounts(ds, col);
+    const levels = counts.size;
+    const total = Array.from(counts.values()).reduce((a, b) => a + b, 0);
+    const smallest = levels > 0 ? Math.min(...Array.from(counts.values())) : 0;
+    return { levels, total, smallest };
+  };
+  if (hints.subgroupCol && !blocked.has(hints.subgroupCol)) {
+    const info = levelInfo(hints.subgroupCol);
+    if (info.levels >= 2 && info.levels <= 20) return hints.subgroupCol;
+  }
+  if (hints.primaryTreatmentCol && !blocked.has(hints.primaryTreatmentCol) && isBinaryLikeColumn(ds, hints.primaryTreatmentCol)) {
+    return hints.primaryTreatmentCol;
+  }
+  let best: { col: string; score: number } | null = null;
+  for (const col of bundle.categoricalCols) {
+    if (blocked.has(col) || bundle.idCols.includes(col)) continue;
+    if (averageTextLength(ds, col) > 40) continue;
+    const info = levelInfo(col);
+    if (info.levels < 2 || info.levels > 20 || info.total < 10) continue;
+    let score = 0;
+    if (info.levels <= 8) score += 4;
+    else if (info.levels <= 12) score += 2;
+    if (info.smallest >= 5) score += 2;
+    if (/(group|sex|gender|region|type|category|status|education|occupation|industry|arm|cohort|class|segment|country|state|prefecture|employment|marital|race|ethnic|treat)/i.test(col)) score += 3;
+    if (/(wave|year|month|date|time|period|quarter)/i.test(col)) score -= 5;
+    score += scoreTopicAlignment(col, topicKeywords);
+    if (!best || score > best.score) best = { col, score };
+  }
+  return best?.col;
+}
+
+function chooseTimeColumn(ds: ParsedDataset, hints: EconometricDesignHints): string | undefined {
+  const candidates = uniqueDefinedColumns([hints.primaryTimeCol, ...hints.timeCols]);
+  for (const col of candidates) {
+    const distinct = sampleDistinctValues(ds, col, 400).length;
+    if (distinct >= 3) return col;
+  }
+  return undefined;
+}
+
+interface TimeBucketing {
+  keyOf: (raw: unknown) => { key: string; order: number } | null;
+}
+
+function buildTimeBucketing(ds: ParsedDataset, timeCol: string): TimeBucketing {
+  const sample = ds.data.slice(0, 2000).map(row => row[timeCol]).filter(v => !isMissingValue(v));
+  const numericShare = sample.filter(v => Number.isFinite(Number(v))).length / Math.max(1, sample.length);
+  if (numericShare >= 0.9) {
+    const values = numericValuesOf(ds, timeCol);
+    const distinct = Array.from(new Set(values)).sort((a, b) => a - b);
+    if (distinct.length <= 40) {
+      return {
+        keyOf: raw => {
+          const v = Number(raw);
+          if (!Number.isFinite(v) || isMissingValue(raw)) return null;
+          // Periods are labels, not quantities: never add thousands separators (2015, not 2,015).
+          return { key: Number.isInteger(v) ? String(v) : String(Number(v.toPrecision(6))), order: v };
+        },
+      };
+    }
+    const min = distinct[0];
+    const max = distinct[distinct.length - 1];
+    const bins = 30;
+    const width = (max - min) / bins || 1;
+    return {
+      keyOf: raw => {
+        const v = Number(raw);
+        if (isMissingValue(raw) || !Number.isFinite(v)) return null;
+        const index = Math.min(bins - 1, Math.max(0, Math.floor((v - min) / width)));
+        const center = min + (index + 0.5) * width;
+        return { key: String(Number(center.toPrecision(5))), order: center };
+      },
+    };
+  }
+  // Date-like strings: bucket by month when the span is short, otherwise by year.
+  const times = sample.map(v => new Date(String(v)).getTime()).filter(t => Number.isFinite(t));
+  const span = times.length ? (Math.max(...times) - Math.min(...times)) / (365.25 * 86400000) : 0;
+  const byMonth = span <= 5;
+  return {
+    keyOf: raw => {
+      if (isMissingValue(raw)) return null;
+      const time = new Date(String(raw)).getTime();
+      if (!Number.isFinite(time)) {
+        const text = String(raw).trim();
+        return text ? { key: text.slice(0, 20), order: Number.NaN } : null;
+      }
+      const date = new Date(time);
+      const year = date.getUTCFullYear();
+      const month = date.getUTCMonth() + 1;
+      return byMonth
+        ? { key: `${year}-${String(month).padStart(2, "0")}`, order: year * 12 + month }
+        : { key: String(year), order: year };
+    },
+  };
+}
+
+/** Gaussian KDE evaluated on a grid and scaled to histogram counts. */
+function kernelDensityCurve(values: number[], lo: number, hi: number, scale: number, gridSize = 80): Array<{ x: number; y: number }> {
+  const sample = values.length > 4000 ? values.filter((_, i) => i % Math.ceil(values.length / 4000) === 0) : values;
+  const summary = summariseValues(sample);
+  if (!summary || summary.sd <= 0) return [];
+  const spread = Math.min(summary.sd, (summary.q3 - summary.q1) / 1.34 || summary.sd);
+  const bandwidth = 0.9 * spread * Math.pow(sample.length, -0.2);
+  if (!(bandwidth > 0)) return [];
+  const points: Array<{ x: number; y: number }> = [];
+  const norm = 1 / (sample.length * bandwidth * Math.sqrt(2 * Math.PI));
+  for (let i = 0; i <= gridSize; i++) {
+    const x = lo + ((hi - lo) * i) / gridSize;
+    let density = 0;
+    for (const v of sample) {
+      const u = (x - v) / bandwidth;
+      if (Math.abs(u) < 6) density += Math.exp(-0.5 * u * u);
+    }
+    points.push({ x: Math.round(x * 1e6) / 1e6, y: Math.round(density * norm * scale * 1e6) / 1e6 });
+  }
+  return points;
+}
+
+function oneWayAnova(groups: number[][]): { f: number; df1: number; df2: number; p: number; eta2: number } | null {
+  const valid = groups.filter(g => g.length >= 2);
+  if (valid.length < 2) return null;
+  const all = valid.flat();
+  const grand = all.reduce((a, b) => a + b, 0) / all.length;
+  let ssBetween = 0;
+  let ssWithin = 0;
+  for (const g of valid) {
+    const gm = g.reduce((a, b) => a + b, 0) / g.length;
+    ssBetween += g.length * (gm - grand) ** 2;
+    for (const v of g) ssWithin += (v - gm) ** 2;
+  }
+  const df1 = valid.length - 1;
+  const df2 = all.length - valid.length;
+  if (df2 <= 0 || ssWithin <= 0) return null;
+  const f = (ssBetween / df1) / (ssWithin / df2);
+  return { f, df1, df2, p: fDistributionPValue(f, df1, df2), eta2: ssBetween / (ssBetween + ssWithin) };
+}
+
+function welchTTest(a: number[], b: number[]): { t: number; df: number; p: number; diff: number } | null {
+  if (a.length < 2 || b.length < 2) return null;
+  const ma = a.reduce((s, v) => s + v, 0) / a.length;
+  const mb = b.reduce((s, v) => s + v, 0) / b.length;
+  const va = a.reduce((s, v) => s + (v - ma) ** 2, 0) / (a.length - 1);
+  const vb = b.reduce((s, v) => s + (v - mb) ** 2, 0) / (b.length - 1);
+  const se2 = va / a.length + vb / b.length;
+  if (!(se2 > 0)) return null;
+  const t = (ma - mb) / Math.sqrt(se2);
+  const df = se2 ** 2 / ((va / a.length) ** 2 / (a.length - 1) + (vb / b.length) ** 2 / (b.length - 1));
+  return { t, df, p: studentTTwoTailPValue(t, df), diff: ma - mb };
+}
+
+function columnStandardDeviation(ds: ParsedDataset, col: string): number {
+  const values = ds.data.map(row => regressorValue(ds, row, col)).filter((v): v is number => v !== null);
+  const summary = summariseValues(values);
+  return summary?.sd || 0;
+}
+
+const SECTION_ORDER: Record<FigureSection, number> = { descriptive: 0, main: 1, diagnostic: 2 };
+const MAX_FIGURES = 12;
+
 export function generateDefaultCharts(
   allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number; fullDataProfile?: FullDataProfile }[],
   executableMethods: Set<string> | null,
   analysisTopic = "",
   analysisInputs?: AnalysisInputs,
   analysisBundle?: AnalysisComputationBundle | null,
-): { name: string; description: string; config: any }[] {
-  const charts: { name: string; description: string; config: any }[] = [];
+): ChartDefinition[] {
+  const charts: ChartDefinition[] = [];
   const bundle = resolveAnalysisComputationBundle(allData, analysisTopic, analysisInputs, executableMethods, analysisBundle);
   const ds = bundle?.ds || getPrimaryDataset(allData);
-  if (!ds || ds.data.length === 0) return charts;
+  if (!ds || ds.data.length === 0 || !bundle) return charts;
 
-  const numericCols = bundle?.meaningfulNumericCols || [];
-  const categoricalCols = bundle?.categoricalCols || [];
-  const designHints = bundle?.designHints;
-  const primaryDescriptiveCol = bundle?.primaryDescriptiveCol;
-  const secondaryDescriptiveCol = bundle?.secondaryDescriptiveCol;
-  const robustOls = bundle?.robustOls || null;
-  const panelFixedEffects = bundle?.panelFixedEffects || null;
-  const diffInDiff = bundle?.diffInDiff || null;
-  const syntheticControl = bundle?.syntheticControl || null;
-  const syntheticControlPlacebos = bundle?.syntheticControlPlacebos || null;
-  const iv2Sls = bundle?.iv2Sls || null;
-  const rdd = bundle?.rdd || null;
-  const propensityScore = bundle?.propensityScore || null;
-  const quantileRegression = bundle?.quantileRegression || null;
-  if (!designHints) return charts;
+  const hints = bundle.designHints;
+  const numericCols = bundle.meaningfulNumericCols || [];
+  const outcomeCol = bundle.primaryDescriptiveCol;
+  const outcomeLabel = outcomeCol ? displayName(outcomeCol) : "";
+  const outcomeIsBinary = outcomeCol ? isBinaryLikeColumn(ds, outcomeCol) : false;
+  const groupCol = chooseGroupingColumn(ds, bundle, [], analysisTopic);
+  const timeCol = chooseTimeColumn(ds, hints);
+  const { robustOls, panelFixedEffects, diffInDiff, syntheticControl, syntheticControlPlacebos, iv2Sls, rdd, propensityScore, quantileRegression } = bundle;
+  const push = (chart: ChartDefinition) => charts.push({ section: "main", ...chart });
 
-  // Chart 1: Distribution of first numeric column (histogram-like bar chart)
-  if (primaryDescriptiveCol && methodAllowed(executableMethods, "descriptive_statistics")) {
-    const col = primaryDescriptiveCol;
-    const values = ds.data.map(r => Number(r[col])).filter(v => !isNaN(v));
-    if (values.length > 0) {
-      const min = Math.min(...values);
-      const max = Math.max(...values);
-      const binCount = Math.min(10, Math.ceil(Math.sqrt(values.length)));
-      const binWidth = (max - min) / binCount || 1;
-      const bins = Array(binCount).fill(0);
-      const labels: string[] = [];
-
-      for (let i = 0; i < binCount; i++) {
-        const mid = min + (i + 0.5) * binWidth;
-        // Use short midpoint labels to prevent overlap in SVG fallback
-        const isInteger = Number.isInteger(min) && Number.isInteger(max) && binWidth >= 1;
-        labels.push(isInteger ? Math.round(mid).toString() : mid.toFixed(1));
+  // ---------------------------------------------------------------- F1: outcome distribution
+  if (outcomeCol && methodAllowed(executableMethods, "descriptive_statistics")) {
+    const values = numericValuesOf(ds, outcomeCol);
+    const summary = summariseValues(values);
+    if (summary && values.length >= 3) {
+      const distinct = new Set(values.slice(0, 5000)).size;
+      const discrete = distinct <= 12 && values.slice(0, 5000).every(v => Number.isInteger(v));
+      const stats = `n = ${formatCount(summary.n)}; mean = ${formatNumber(summary.mean)} (SD = ${formatNumber(summary.sd)}); median = ${formatNumber(summary.median)}`;
+      let config: any;
+      let note = "";
+      if (discrete) {
+        const counts = new Map<number, number>();
+        for (const v of values) counts.set(v, (counts.get(v) || 0) + 1);
+        const keys = Array.from(counts.keys()).sort((a, b) => a - b);
+        config = {
+          type: "bar",
+          data: {
+            labels: keys.map(k => String(k)),
+            datasets: [{ label: outcomeLabel, data: keys.map(k => Math.round((counts.get(k)! / values.length) * 1000) / 10), backgroundColor: FIGURE_COLORS.primary }],
+          },
+          options: {
+            plugins: { title: { display: true, text: `Distribution of ${outcomeLabel}` }, subtitle: { text: stats }, valueLabels: { decimals: 1, suffix: "%" } },
+            scales: { x: { title: { display: true, text: outcomeLabel } }, y: { title: { display: true, text: "Share of observations (%)" } } },
+          },
+        };
+        note = "Bars show the share of observations taking each value.";
+      } else {
+        const sorted = [...values].sort((a, b) => a - b);
+        const p005 = sortedQuantile(sorted, 0.005);
+        const p995 = sortedQuantile(sorted, 0.995);
+        const core = p995 - p005;
+        const trim = core > 0 && (summary.max - p995 > 0.5 * core || p005 - summary.min > 0.5 * core);
+        const lo = trim ? p005 : summary.min;
+        const hi = trim ? p995 : summary.max;
+        const inRange = trim ? values.filter(v => v >= lo && v <= hi) : values;
+        const iqr = summary.q3 - summary.q1;
+        const fdWidth = iqr > 0 ? (2 * iqr) / Math.cbrt(inRange.length) : 0;
+        const sturges = Math.ceil(Math.log2(inRange.length) + 1);
+        const binCount = Math.max(6, Math.min(40, fdWidth > 0 ? Math.ceil((hi - lo) / fdWidth) : sturges));
+        const width = (hi - lo) / binCount || 1;
+        const counts = Array(binCount).fill(0);
+        for (const v of inRange) counts[Math.min(binCount - 1, Math.max(0, Math.floor((v - lo) / width)))]++;
+        const bins = counts.map((count, i) => ({ x0: lo + i * width, x1: lo + (i + 1) * width, count }));
+        const density = kernelDensityCurve(inRange, lo, hi, inRange.length * width);
+        config = {
+          type: "histogram",
+          data: {
+            datasets: [
+              { label: "Observations", data: bins, backgroundColor: FIGURE_COLORS.primary },
+              ...(density.length ? [{ type: "line", label: "Kernel density (scaled to counts)", data: density, borderColor: FIGURE_COLORS.secondary }] : []),
+            ],
+          },
+          options: {
+            plugins: { title: { display: true, text: `Distribution of ${outcomeLabel}` }, subtitle: { text: stats } },
+            referenceLines: [{ axis: "x", value: summary.mean, label: `Mean ${formatNumber(summary.mean)}` }],
+            scales: { x: { title: { display: true, text: outcomeLabel } }, y: { title: { display: true, text: "Number of observations" } } },
+          },
+        };
+        note = `Bars use ${binCount} equal-width bins (Freedman-Diaconis rule); the curve is a Gaussian kernel density estimate scaled to counts; the dashed line marks the mean.${trim ? ` The horizontal axis is limited to the 0.5th-99.5th percentiles (${formatCount(values.length - inRange.length)} extreme observations not shown).` : ""}`;
       }
-      for (const v of values) {
-        const idx = Math.min(Math.floor((v - min) / binWidth), binCount - 1);
-        bins[idx]++;
-      }
-
-      // Truncate column name for display
-      const displayCol = col.length > 40 ? col.slice(0, 37) + "..." : col;
-
-      charts.push({
+      push({
         name: "distribution_histogram",
-        description: `Distribution of ${displayCol} (n=${values.length})`,
+        description: `Distribution of ${outcomeLabel} (n = ${formatCount(values.length)})`,
+        caption: `Distribution of ${outcomeLabel} (${stats}). ${note}`,
+        section: "descriptive",
+        config,
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------- F2: categorical composition
+  if (groupCol && methodAllowed(executableMethods, "descriptive_statistics")) {
+    const counts = categoryCounts(ds, groupCol);
+    const entries = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+    if (entries.length >= 2) {
+      const total = entries.reduce((sum, [, c]) => sum + c, 0);
+      const top = entries.slice(0, 12);
+      const rest = entries.slice(12).reduce((sum, [, c]) => sum + c, 0);
+      if (rest > 0) top.push([`Other (${entries.length - 12} categories)`, rest]);
+      const label = displayName(groupCol);
+      push({
+        name: "category_distribution",
+        description: `Composition of the sample by ${label}`,
+        caption: `Composition of the sample by ${label} (N = ${formatCount(total)}). Bars show the percentage of observations in each category${rest > 0 ? "; smaller categories are pooled as Other" : ""}.`,
+        section: "descriptive",
+        height: Math.max(360, Math.min(620, 150 + top.length * 34)),
         config: {
           type: "bar",
           data: {
-            labels,
-            datasets: [{
-              label: displayCol,
-              data: bins,
-              backgroundColor: "rgba(78, 121, 167, 0.7)",
-              borderColor: "rgba(78, 121, 167, 1)",
-              borderWidth: 1,
-            }],
+            labels: top.map(([k]) => k),
+            datasets: [{ label: "Share (%)", data: top.map(([, c]) => Math.round((c / total) * 1000) / 10), backgroundColor: FIGURE_COLORS.primary }],
           },
           options: {
-            plugins: { title: { display: true, text: `Distribution of ${displayCol}`, font: { size: 16 } } },
-            scales: { y: { title: { display: true, text: "Frequency" } }, x: { title: { display: true, text: displayCol } } },
+            indexAxis: "y",
+            plugins: { title: { display: true, text: `Sample composition by ${label}` }, valueLabels: { decimals: 1, suffix: "%" } },
+            scales: { x: { title: { display: true, text: "Share of observations (%)" } }, y: { title: { display: true, text: label } } },
           },
         },
       });
     }
   }
 
-  // Chart 2: Scatter plot of best-correlated numeric pair (with regression line if applicable)
-  if (numericCols.length >= 2 && methodAllowed(executableMethods, "correlation")) {
-    // Find the pair with highest absolute correlation (scan up to 15 pairs)
-    let bestAbsCorr = -1;
-    let xCol = secondaryDescriptiveCol || numericCols[0];
-    let yCol = primaryDescriptiveCol || numericCols[1];
-    const pairLimit = Math.min(numericCols.length, 6); // up to C(6,2)=15 pairs
-    for (let ai = 0; ai < pairLimit; ai++) {
-      for (let bi = ai + 1; bi < pairLimit; bi++) {
-        const pairs = parseNumericPairs(ds, numericCols[ai], numericCols[bi]);
-        if (pairs.length < 5) continue;
-        const reg = regressionStatsFromPairs(pairs);
-        const absCorr = reg ? Math.sqrt(reg.r2) : 0;
-        if (absCorr > bestAbsCorr) {
-          bestAbsCorr = absCorr;
-          xCol = numericCols[ai];
-          yCol = numericCols[bi];
+  // ---------------------------------------------------------------- F3/F4: outcome by group
+  if (outcomeCol && groupCol && groupCol !== outcomeCol && methodAllowed(executableMethods, "group_comparison")) {
+    const grouped = groupNumericValues(ds, groupCol, outcomeCol);
+    const eligible = Array.from(grouped.entries()).filter(([, v]) => v.length >= 3);
+    const kept = eligible.sort((a, b) => b[1].length - a[1].length).slice(0, 12);
+    const keys = orderCategoryKeys(kept.map(([k]) => k), k => grouped.get(k)?.length || 0);
+    const groupLabel = displayName(groupCol);
+    if (keys.length >= 2) {
+      const anova = oneWayAnova(keys.map(k => grouped.get(k)!));
+      const testText = anova
+        ? `One-way ANOVA: F(${anova.df1}, ${anova.df2}) = ${anova.f.toFixed(2)}, p ${anova.p < 0.001 ? "< 0.001" : `= ${anova.p.toFixed(3)}`}, eta^2 = ${anova.eta2.toFixed(3)}`
+        : "";
+      if (!outcomeIsBinary && isContinuousColumn(ds, outcomeCol)) {
+        const boxes = keys.map(key => {
+          const sorted = [...grouped.get(key)!].sort((a, b) => a - b);
+          const q1 = sortedQuantile(sorted, 0.25);
+          const q3 = sortedQuantile(sorted, 0.75);
+          const iqr = q3 - q1;
+          const lowFence = q1 - 1.5 * iqr;
+          const highFence = q3 + 1.5 * iqr;
+          const inside = sorted.filter(v => v >= lowFence && v <= highFence);
+          const outliers = sorted.filter(v => v < lowFence || v > highFence);
+          const pickedOutliers = outliers.length > 12 ? [...outliers.slice(0, 6), ...outliers.slice(-6)] : outliers;
+          return {
+            min: inside.length ? inside[0] : sorted[0],
+            q1,
+            median: sortedQuantile(sorted, 0.5),
+            q3,
+            max: inside.length ? inside[inside.length - 1] : sorted[sorted.length - 1],
+            mean: sorted.reduce((a, b) => a + b, 0) / sorted.length,
+            outliers: pickedOutliers,
+          };
+        });
+        push({
+          name: "box_plot",
+          description: `Distribution of ${outcomeLabel} by ${groupLabel}`,
+          caption: `Distribution of ${outcomeLabel} by ${groupLabel}. Boxes span the interquartile range, the thick line marks the median, the diamond marks the mean, whiskers extend to 1.5 x IQR and circles show observations beyond the whiskers.${testText ? ` ${testText}.` : ""}`,
+          section: "descriptive",
+          config: {
+            type: "boxplot",
+            data: { labels: keys, datasets: [{ label: outcomeLabel, data: boxes, backgroundColor: "rgba(42, 120, 214, 0.35)", borderColor: "#1c5cab" }] },
+            options: {
+              plugins: { title: { display: true, text: `${outcomeLabel} by ${groupLabel}` }, subtitle: { text: testText } },
+              scales: { x: { title: { display: true, text: groupLabel } }, y: { title: { display: true, text: outcomeLabel } } },
+            },
+          },
+        });
+      }
+      const cis = keys.map(key => meanConfidenceInterval(grouped.get(key)!)!);
+      const horizontal = keys.length > 6 || keys.some(k => k.length > 14);
+      const valueTitle = outcomeIsBinary ? `Share with ${outcomeLabel} = 1` : `Mean ${outcomeLabel}`;
+      push({
+        name: "category_comparison",
+        description: `Mean ${outcomeLabel} by ${groupLabel} with 95% confidence intervals`,
+        caption: `${outcomeIsBinary ? "Proportion" : "Mean"} of ${outcomeLabel} by ${groupLabel}. Error bars are 95% confidence intervals based on the t distribution (group sizes ${keys.map((k, i) => `${k}: ${formatCount(cis[i].n)}`).slice(0, 6).join(", ")}${keys.length > 6 ? ", ..." : ""}).${testText ? ` ${testText}.` : ""}`,
+        section: "main",
+        height: horizontal ? Math.max(380, Math.min(640, 150 + keys.length * 36)) : undefined,
+        config: {
+          type: "bar",
+          data: {
+            labels: keys,
+            datasets: [{
+              label: valueTitle,
+              data: cis.map(ci => roundSig(ci.mean)),
+              errorBars: cis.map(ci => [roundSig(ci.low), roundSig(ci.high)]),
+              backgroundColor: FIGURE_COLORS.primary,
+            }],
+          },
+          options: {
+            indexAxis: horizontal ? "y" : "x",
+            plugins: { title: { display: true, text: `${valueTitle} by ${groupLabel} (95% CI)` }, subtitle: { text: testText } },
+            scales: horizontal
+              ? { x: { title: { display: true, text: valueTitle } }, y: { title: { display: true, text: groupLabel } } }
+              : { x: { title: { display: true, text: groupLabel } }, y: { title: { display: true, text: valueTitle } } },
+          },
+        },
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------- F5: correlation heatmap
+  if (numericCols.length >= 3 && methodAllowed(executableMethods, "correlation")) {
+    const cols = numericCols.filter(c => !isPathologicalNumericColumn(ds, c)).slice(0, 8);
+    if (cols.length >= 3) {
+      const cells: Array<{ x: number; y: number; v: number }> = [];
+      let minN = Infinity;
+      let maxN = 0;
+      for (let i = 0; i < cols.length; i++) {
+        for (let j = 0; j <= i; j++) {
+          if (i === j) { cells.push({ x: j, y: i, v: 1 }); continue; }
+          const result = pearsonFromPairs(parseNumericPairs(ds, cols[i], cols[j]).filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b)));
+          if (result) {
+            minN = Math.min(minN, result.n);
+            maxN = Math.max(maxN, result.n);
+          }
+          cells.push({ x: j, y: i, v: result ? Math.round(result.r * 100) / 100 : 0 });
+        }
+      }
+      push({
+        name: "correlation_matrix",
+        description: "Pairwise Pearson correlations among the main numeric variables",
+        caption: `Pairwise Pearson correlation coefficients among ${cols.length} numeric variables (pairwise-complete observations${Number.isFinite(minN) ? `, n = ${formatCount(minN)}${maxN !== minN ? `-${formatCount(maxN)}` : ""}` : ""}). Blue indicates positive and red negative association; the lower triangle is shown.`,
+        section: "descriptive",
+        width: 900,
+        height: 640,
+        config: {
+          type: "heatmap",
+          data: { labels: cols.map(c => displayName(c, 28)), datasets: [{ data: cells }] },
+          options: { heatmap: { triangle: "lower" }, plugins: { title: { display: true, text: "Correlation matrix (Pearson r)" } } },
+        },
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------- F6: key bivariate relation
+  if (outcomeCol && numericCols.length >= 2 && methodAllowed(executableMethods, "correlation")) {
+    let xCol: string | undefined;
+    if (hints.primaryRegressorCol && hints.primaryRegressorCol !== outcomeCol && numericCols.includes(hints.primaryRegressorCol) && isContinuousColumn(ds, hints.primaryRegressorCol)) {
+      xCol = hints.primaryRegressorCol;
+    } else {
+      let bestAbs = -1;
+      for (const candidate of numericCols.slice(0, 10)) {
+        if (candidate === outcomeCol || !isContinuousColumn(ds, candidate) || isPathologicalNumericColumn(ds, candidate)) continue;
+        const result = pearsonFromPairs(parseNumericPairs(ds, candidate, outcomeCol));
+        if (result && Math.abs(result.r) > bestAbs) {
+          bestAbs = Math.abs(result.r);
+          xCol = candidate;
         }
       }
     }
-    const points = ds.data
-      .map(r => ({ x: Number(r[xCol]), y: Number(r[yCol]) }))
-      .filter(p => !isNaN(p.x) && !isNaN(p.y) && isFinite(p.x) && isFinite(p.y))
-      .slice(0, 200);
-
-    if (points.length >= 5) {
-      const displayXCol = xCol.length > 30 ? xCol.slice(0, 27) + "..." : xCol;
-      const displayYCol = yCol.length > 30 ? yCol.slice(0, 27) + "..." : yCol;
-
-      const datasets: any[] = [{
-        label: `${displayXCol} vs ${displayYCol}`,
-        data: points,
-        backgroundColor: "rgba(242, 142, 43, 0.6)",
-        borderColor: "rgba(242, 142, 43, 1)",
-        pointRadius: 3,
-        type: "scatter",
-      }];
-
-      // Add regression line if linear_regression is executable
-      let titleSuffix = "";
-      if (methodAllowed(executableMethods, "linear_regression") && points.length >= 10) {
-        const pairs: [number, number][] = points.map(p => [p.x, p.y]);
-        const reg = regressionStatsFromPairs(pairs);
-        if (reg && reg.r2 > 0) {
-          const xMin = Math.min(...points.map(p => p.x));
-          const xMax = Math.max(...points.map(p => p.x));
-          const linePoints = [
-            { x: xMin, y: reg.intercept + reg.slope * xMin },
-            { x: xMax, y: reg.intercept + reg.slope * xMax },
-          ];
+    if (xCol) {
+      const pairs = parseNumericPairs(ds, xCol, outcomeCol).filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b));
+      const corr = pearsonFromPairs(pairs);
+      const reg = regressionStatsFromPairs(pairs);
+      if (corr && pairs.length >= 10) {
+        const stride = Math.max(1, Math.ceil(pairs.length / 1500));
+        const xDistinct = new Set(pairs.slice(0, 3000).map(p => p[0])).size;
+        const yDistinct = new Set(pairs.slice(0, 3000).map(p => p[1])).size;
+        const xs = pairs.map(p => p[0]);
+        const xMin = Math.min(...xs);
+        const xMax = Math.max(...xs);
+        const ys = pairs.map(p => p[1]);
+        const yRange = Math.max(...ys) - Math.min(...ys) || 1;
+        const xRange = xMax - xMin || 1;
+        const jitter = (i: number, span: number, distinct: number) => (distinct <= 15 ? (((i * 7919) % 1000) / 1000 - 0.5) * span * 0.02 : 0);
+        const points = [] as Array<{ x: number; y: number }>;
+        for (let i = 0; i < pairs.length; i += stride) {
+          points.push({
+            x: roundSig((pairs[i][0] + jitter(i, xRange, xDistinct))),
+            y: roundSig((pairs[i][1] + jitter(i + 13, yRange, yDistinct))),
+          });
+        }
+        const xLabel = displayName(xCol);
+        const datasets: any[] = [{ label: "Observations", data: points, backgroundColor: FIGURE_COLORS.primary, pointRadius: pairs.length > 800 ? 2.2 : 3 }];
+        if (reg) {
           datasets.push({
-            label: `y = ${reg.slope.toFixed(3)}x + ${reg.intercept.toFixed(3)} (R²=${reg.r2.toFixed(3)})`,
-            data: linePoints,
-            type: "scatter",
+            label: `Least-squares fit (slope = ${formatNumber(reg.slope)})`,
+            data: [{ x: xMin, y: reg.intercept + reg.slope * xMin }, { x: xMax, y: reg.intercept + reg.slope * xMax }],
             showLine: true,
             pointRadius: 0,
-            borderColor: "rgba(225, 87, 89, 1)",
-            borderWidth: 2,
-            borderDash: [6, 3],
-            fill: false,
-          });
-          titleSuffix = ` (R²=${reg.r2.toFixed(3)})`;
-        }
-      }
-
-      charts.push({
-        name: "scatter_plot",
-        description: `Scatter plot: ${displayXCol} vs ${displayYCol}${titleSuffix}`,
-        config: {
-          type: "scatter",
-          data: { datasets },
-          options: {
-            plugins: { title: { display: true, text: `${displayXCol} vs ${displayYCol}${titleSuffix}`, font: { size: 16 } } },
-            scales: {
-              x: { title: { display: true, text: displayXCol } },
-              y: { title: { display: true, text: displayYCol } },
-            },
-          },
-        },
-      });
-    }
-  }
-
-  // Chart 3: Bar chart by categorical column (if available)
-  if (categoricalCols.length > 0 && primaryDescriptiveCol && methodAllowed(executableMethods, "group_comparison")) {
-    const catCol = categoricalCols[0];
-    const numCol = primaryDescriptiveCol;
-    const groups: Record<string, number[]> = {};
-    for (const row of ds.data) {
-      const key = String(row[catCol] ?? "N/A").slice(0, 30);
-      if (!groups[key]) groups[key] = [];
-      groups[key].push(Number(row[numCol]));
-    }
-    const sortedKeys = Object.keys(groups).sort().slice(0, 20);
-    const means = sortedKeys.map(k => {
-      const vals = groups[k].filter(v => !isNaN(v));
-      return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
-    });
-
-    const displayCatCol = catCol.length > 30 ? catCol.slice(0, 27) + "..." : catCol;
-    const displayNumCol = numCol.length > 30 ? numCol.slice(0, 27) + "..." : numCol;
-
-    charts.push({
-      name: "category_comparison",
-      description: `Mean ${displayNumCol} by ${displayCatCol}`,
-      config: {
-        type: "bar",
-        data: {
-          labels: sortedKeys,
-          datasets: [{
-            label: `Mean ${displayNumCol}`,
-            data: means.map(m => Math.round(m * 100) / 100),
-            backgroundColor: "rgba(225, 87, 89, 0.7)",
-            borderColor: "rgba(225, 87, 89, 1)",
-            borderWidth: 1,
-          }],
-        },
-        options: {
-          plugins: { title: { display: true, text: `Mean ${displayNumCol} by ${displayCatCol}`, font: { size: 16 } } },
-          scales: { y: { title: { display: true, text: `Mean ${displayNumCol}` } } },
-        },
-      },
-    });
-  }
-
-  // Chart 4: Correlation heatmap (if multiple numeric cols)
-  if (numericCols.length >= 3 && methodAllowed(executableMethods, "correlation")) {
-    const cols = numericCols.slice(0, 8);
-    const displayCols = cols.map(c => c.length > 15 ? c.slice(0, 12) + "..." : c);
-    const heatmapData: { x: number; y: number; v: number }[] = [];
-    for (let ci = 0; ci < cols.length; ci++) {
-      for (let cj = 0; cj < cols.length; cj++) {
-        const pairs = parseNumericPairs(ds, cols[ci], cols[cj]);
-        const n = pairs.length;
-        let corr = ci === cj ? 1 : 0;
-        if (ci !== cj && n >= 3) {
-          const m1 = pairs.reduce((s, p) => s + p[0], 0) / n;
-          const m2 = pairs.reduce((s, p) => s + p[1], 0) / n;
-          let num = 0, d1 = 0, d2 = 0;
-          for (const [a, b] of pairs) {
-            num += (a - m1) * (b - m2);
-            d1 += (a - m1) ** 2;
-            d2 += (b - m2) ** 2;
-          }
-          corr = d1 > 0 && d2 > 0 ? num / Math.sqrt(d1 * d2) : 0;
-        }
-        corr = Math.round(corr * 100) / 100;
-        heatmapData.push({ x: ci, y: cj, v: corr });
-      }
-    }
-
-    charts.push({
-      name: "correlation_matrix",
-      description: `Correlation heatmap of numeric variables`,
-      config: {
-        type: "heatmap",
-        data: {
-          labels: displayCols,
-          datasets: [{ data: heatmapData }],
-        },
-        options: {
-          plugins: {
-            title: { display: true, text: "Correlation Matrix", font: { size: 16 } },
-          },
-        },
-      },
-    });
-  }
-
-  // Chart 5: Pie chart of first categorical column (if available)
-  if (categoricalCols.length > 0 && methodAllowed(executableMethods, "descriptive_statistics")) {
-    const catCol = categoricalCols[0];
-    const counts: Record<string, number> = {};
-    for (const row of ds.data) {
-      const key = String(row[catCol] ?? "N/A").slice(0, 30);
-      counts[key] = (counts[key] || 0) + 1;
-    }
-    const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
-    const topN = sorted.slice(0, 10);
-    const otherCount = sorted.slice(10).reduce((sum, [, c]) => sum + c, 0);
-    if (otherCount > 0) topN.push(["Other", otherCount]);
-
-    const displayCatCol = catCol.length > 30 ? catCol.slice(0, 27) + "..." : catCol;
-    const pieColors = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949", "#af7aa1", "#ff9da7", "#9c755f", "#bab0ab", "#86bcb6"];
-
-    charts.push({
-      name: "category_distribution",
-      description: `Distribution of ${displayCatCol}`,
-      config: {
-        type: "pie",
-        data: {
-          labels: topN.map(([k]) => k),
-          datasets: [{
-            data: topN.map(([, v]) => v),
-            backgroundColor: pieColors.slice(0, topN.length),
-          }],
-        },
-        options: {
-          plugins: { title: { display: true, text: `Distribution of ${displayCatCol}`, font: { size: 16 } } },
-        },
-      },
-    });
-  }
-
-  // Chart 6: Time trend line chart (if time-like columns exist)
-  const timeCols = ds.columns.filter(c => /(year|month|date|time|wave|period|quarter)/i.test(c));
-  if (timeCols.length > 0 && primaryDescriptiveCol && methodAllowed(executableMethods, "time_trend")) {
-    const timeCol = timeCols[0];
-    const numCol = primaryDescriptiveCol;
-
-    // Aggregate by time value (mean of numeric col per time point)
-    const timeGroups: Record<string, number[]> = {};
-    for (const row of ds.data) {
-      const tRaw = row[timeCol];
-      const val = Number(row[numCol]);
-      if (tRaw === null || tRaw === undefined || tRaw === "" || isNaN(val)) continue;
-      const tKey = String(tRaw);
-      if (!timeGroups[tKey]) timeGroups[tKey] = [];
-      timeGroups[tKey].push(val);
-    }
-    const sortedTimeKeys = Object.keys(timeGroups).sort((a, b) => {
-      const na = Number(a), nb = Number(b);
-      if (!isNaN(na) && !isNaN(nb)) return na - nb;
-      return a.localeCompare(b);
-    }).slice(0, 50);
-    const timeMeans = sortedTimeKeys.map(k => {
-      const vals = timeGroups[k];
-      return Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 1000) / 1000;
-    });
-
-    if (sortedTimeKeys.length >= 3) {
-      const displayTimeCol = timeCol.length > 30 ? timeCol.slice(0, 27) + "..." : timeCol;
-      const displayNumCol = numCol.length > 30 ? numCol.slice(0, 27) + "..." : numCol;
-
-      // Compute linear trend line
-      const trendDatasets: any[] = [{
-        label: `Mean ${displayNumCol}`,
-        data: timeMeans,
-        borderColor: "#4e79a7",
-        backgroundColor: "rgba(78, 121, 167, 0.1)",
-        tension: 0.1,
-        fill: true,
-      }];
-
-      // Add linear trend line
-      if (sortedTimeKeys.length >= 5) {
-        const xVals = sortedTimeKeys.map((_, i) => i);
-        const trendPairs: [number, number][] = xVals.map((x, i) => [x, timeMeans[i]]);
-        const trendReg = regressionStatsFromPairs(trendPairs);
-        if (trendReg) {
-          const trendLine = xVals.map(x => Math.round((trendReg.intercept + trendReg.slope * x) * 1000) / 1000);
-          trendDatasets.push({
-            label: `Trend (slope=${trendReg.slope.toFixed(3)})`,
-            data: trendLine,
-            borderColor: "rgba(225, 87, 89, 0.8)",
-            borderWidth: 2,
-            borderDash: [6, 3],
-            pointRadius: 0,
-            fill: false,
+            borderColor: FIGURE_COLORS.accent,
           });
         }
-      }
-
-      charts.push({
-        name: "time_trend",
-        description: `Trend of ${displayNumCol} over ${displayTimeCol}`,
-        config: {
-          type: "line",
-          data: {
-            labels: sortedTimeKeys,
-            datasets: trendDatasets,
-          },
-          options: {
-            plugins: { title: { display: true, text: `Trend of ${displayNumCol} over ${displayTimeCol}`, font: { size: 16 } } },
-            scales: {
-              x: { title: { display: true, text: displayTimeCol } },
-              y: { title: { display: true, text: `Mean ${displayNumCol}` } },
+        const stats = `r = ${corr.r.toFixed(3)} (p ${corr.p < 0.001 ? "< 0.001" : `= ${corr.p.toFixed(3)}`}), n = ${formatCount(corr.n)}`;
+        push({
+          name: "scatter_plot",
+          description: `${outcomeLabel} versus ${xLabel} (${stats})`,
+          caption: `Relationship between ${xLabel} and ${outcomeLabel} (${stats}). Points are individual observations${stride > 1 ? ` (every ${stride}th observation plotted)` : ""}${xDistinct <= 15 || yDistinct <= 15 ? " with slight jitter to reduce overplotting" : ""}; the line is the bivariate least-squares fit.`,
+          section: "main",
+          config: {
+            type: "scatter",
+            data: { datasets },
+            options: {
+              plugins: { title: { display: true, text: `${outcomeLabel} vs ${xLabel}` }, subtitle: { text: stats } },
+              scales: { x: { title: { display: true, text: xLabel } }, y: { title: { display: true, text: outcomeLabel } } },
             },
           },
-        },
-      });
+        });
+      }
     }
   }
 
-  // Chart 7: Box plot approximation (floating bar showing Q1–Q3 with median marker)
-  if (categoricalCols.length > 0 && primaryDescriptiveCol && methodAllowed(executableMethods, "group_comparison")) {
-    const catCol = categoricalCols[0];
-    const numCol = primaryDescriptiveCol;
-    const groups: Record<string, number[]> = {};
+  // ---------------------------------------------------------------- F7: time trend
+  if (timeCol && outcomeCol && timeCol !== outcomeCol && methodAllowed(executableMethods, "time_trend")) {
+    const bucketing = buildTimeBucketing(ds, timeCol);
+    // A time-varying treatment indicator would split the series mechanically at onset;
+    // the parallel-trends figure handles treated-versus-control comparisons instead.
+    const trendGroupCol = groupCol && groupCol !== timeCol && groupCol !== hints.primaryTreatmentCol && categoryCounts(ds, groupCol).size <= 5 ? groupCol : undefined;
+    const buckets = new Map<string, { order: number; byGroup: Map<string, number[]> }>();
     for (const row of ds.data) {
-      const key = String(row[catCol] ?? "N/A").slice(0, 30);
-      const val = Number(row[numCol]);
-      if (isNaN(val)) continue;
-      if (!groups[key]) groups[key] = [];
-      groups[key].push(val);
+      const bucket = bucketing.keyOf(row[timeCol]);
+      if (!bucket) continue;
+      const raw = row[outcomeCol];
+      if (isMissingValue(raw)) continue;
+      const value = Number(raw);
+      if (!Number.isFinite(value)) continue;
+      const group = trendGroupCol ? categoryKey(row[trendGroupCol]) : "All";
+      if (group === null) continue;
+      const entry = buckets.get(bucket.key) || { order: bucket.order, byGroup: new Map<string, number[]>() };
+      const list = entry.byGroup.get(group) || [];
+      list.push(value);
+      entry.byGroup.set(group, list);
+      buckets.set(bucket.key, entry);
     }
-    const sortedKeys = Object.keys(groups).sort().slice(0, 15);
-    const boxStats = sortedKeys.map(k => {
-      const vals = groups[k].sort((a, b) => a - b);
-      const q1Idx = Math.floor(vals.length * 0.25);
-      const medIdx = Math.floor(vals.length * 0.5);
-      const q3Idx = Math.floor(vals.length * 0.75);
-      return {
-        q1: vals[q1Idx] ?? 0,
-        median: vals[medIdx] ?? 0,
-        q3: vals[q3Idx] ?? 0,
-        min: vals[0] ?? 0,
-        max: vals[vals.length - 1] ?? 0,
-      };
-    });
-
-    if (boxStats.length >= 2) {
-      const displayCatCol = catCol.length > 30 ? catCol.slice(0, 27) + "..." : catCol;
-      const displayNumCol = numCol.length > 30 ? numCol.slice(0, 27) + "..." : numCol;
-
-      charts.push({
-        name: "box_plot_approx",
-        description: `Box plot of ${displayNumCol} by ${displayCatCol}`,
-        config: {
-          type: "bar",
-          data: {
-            labels: sortedKeys,
-            datasets: [
-              {
-                label: "Q1–Q3 range",
-                data: boxStats.map(s => [s.q1, s.q3]),
-                backgroundColor: "rgba(78, 121, 167, 0.5)",
-                borderColor: "rgba(78, 121, 167, 1)",
-                borderWidth: 1,
-                borderSkipped: false,
-              },
-              {
-                label: "Median",
-                data: boxStats.map(s => s.median),
-                type: "line",
-                borderColor: "rgba(225, 87, 89, 1)",
-                backgroundColor: "rgba(225, 87, 89, 0.8)",
-                pointRadius: 5,
-                pointStyle: "rectRot",
-                showLine: false,
-              },
-            ],
-          },
-          options: {
-            plugins: { title: { display: true, text: `Box Plot: ${displayNumCol} by ${displayCatCol}`, font: { size: 16 } } },
-            scales: {
-              y: { title: { display: true, text: displayNumCol } },
-              x: { title: { display: true, text: displayCatCol } },
-            },
-          },
-        },
-      });
-    }
-  }
-
-  // Chart 8: Grouped bar chart (multiple numeric variables by category)
-  if (categoricalCols.length > 0 && numericCols.length >= 2 && methodAllowed(executableMethods, "group_comparison")) {
-    const catCol = categoricalCols[0];
-    const useCols = Array.from(new Set([primaryDescriptiveCol, secondaryDescriptiveCol, ...numericCols].filter(Boolean) as string[])).slice(0, 4);
-    const groups: Record<string, Record<string, number[]>> = {};
-    for (const row of ds.data) {
-      const key = String(row[catCol] ?? "N/A").slice(0, 30);
-      if (!groups[key]) groups[key] = {};
-      for (const nc of useCols) {
-        if (!groups[key][nc]) groups[key][nc] = [];
-        const val = Number(row[nc]);
-        if (!isNaN(val)) groups[key][nc].push(val);
-      }
-    }
-    const sortedKeys = Object.keys(groups).sort().slice(0, 15);
-    const barColors = ["rgba(78, 121, 167, 0.7)", "rgba(242, 142, 43, 0.7)", "rgba(225, 87, 89, 0.7)", "rgba(118, 183, 178, 0.7)"];
-    const borderColors = ["rgba(78, 121, 167, 1)", "rgba(242, 142, 43, 1)", "rgba(225, 87, 89, 1)", "rgba(118, 183, 178, 1)"];
-
-    if (sortedKeys.length >= 2) {
-      const displayCatCol = catCol.length > 30 ? catCol.slice(0, 27) + "..." : catCol;
-
-      charts.push({
-        name: "grouped_bar_multivar",
-        description: `Grouped comparison of ${useCols.length} variables by ${displayCatCol}`,
-        config: {
-          type: "bar",
-          data: {
-            labels: sortedKeys,
-            datasets: useCols.map((nc, idx) => {
-              const displayNc = nc.length > 20 ? nc.slice(0, 17) + "..." : nc;
-              return {
-                label: `Mean ${displayNc}`,
-                data: sortedKeys.map(k => {
-                  const vals = (groups[k]?.[nc] || []).filter(v => !isNaN(v));
-                  return vals.length > 0 ? Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 100) / 100 : 0;
-                }),
-                backgroundColor: barColors[idx % barColors.length],
-                borderColor: borderColors[idx % borderColors.length],
-                borderWidth: 1,
-              };
-            }),
-          },
-          options: {
-            plugins: {
-              title: {
-                display: true,
-                text: `Comparison by ${displayCatCol} (${useCols.map(c => c.length > 12 ? c.slice(0, 9) + "..." : c).join(", ")})`,
-                font: { size: 16 },
-              },
-              legend: { display: false },
-            },
-            scales: { y: { title: { display: true, text: "Mean value" } }, x: { title: { display: true, text: displayCatCol } } },
-          },
-        },
-      });
-    }
-  }
-
-  // Chart 9: Density plot (KDE approximation) for first numeric column
-  if (primaryDescriptiveCol && methodAllowed(executableMethods, "descriptive_statistics")) {
-    const col = primaryDescriptiveCol;
-    const values = ds.data.map(r => Number(r[col])).filter(v => !isNaN(v));
-    if (values.length >= 20) {
-      const sorted = [...values].sort((a, b) => a - b);
-      const min = sorted[0];
-      const max = sorted[sorted.length - 1];
-      const range = max - min || 1;
-      // Silverman's rule of thumb for bandwidth
-      const std = Math.sqrt(values.reduce((s, v) => s + (v - values.reduce((a, b) => a + b, 0) / values.length) ** 2, 0) / values.length);
-      const bandwidth = 1.06 * std * Math.pow(values.length, -0.2) || range / 20;
-      const gridSize = 50;
-      const step = range / gridSize;
-      const xPoints: number[] = [];
-      const yPoints: number[] = [];
-      for (let i = 0; i <= gridSize; i++) {
-        const x = min + i * step;
-        xPoints.push(Math.round(x * 100) / 100);
-        // Gaussian KDE
-        let density = 0;
-        for (const v of values) {
-          const u = (x - v) / bandwidth;
-          density += Math.exp(-0.5 * u * u) / (bandwidth * Math.sqrt(2 * Math.PI));
-        }
-        density /= values.length;
-        yPoints.push(Math.round(density * 10000) / 10000);
-      }
-
-      const displayCol = col.length > 40 ? col.slice(0, 37) + "..." : col;
-      charts.push({
-        name: "density_plot",
-        description: `Density estimate of ${displayCol} (KDE, n=${values.length})`,
-        config: {
-          type: "line",
-          data: {
-            labels: xPoints.map(String),
-            datasets: [{
-              label: `Density of ${displayCol}`,
-              data: yPoints,
-              borderColor: "rgba(118, 183, 178, 1)",
-              backgroundColor: "rgba(118, 183, 178, 0.3)",
-              fill: true,
-              tension: 0.4,
-              pointRadius: 0,
-            }],
-          },
-          options: {
-            plugins: { title: { display: true, text: `Density Estimate: ${displayCol}`, font: { size: 16 } } },
-            scales: {
-              x: { title: { display: true, text: displayCol } },
-              y: { title: { display: true, text: "Density" } },
-            },
-          },
-        },
-      });
-    }
-  }
-
-  // Chart 10: Pairwise scatter matrix (top correlated pairs beyond the main scatter)
-  if (numericCols.length >= 3 && methodAllowed(executableMethods, "correlation")) {
-    // Collect all pairwise correlations
-    const pairCorrs: { a: string; b: string; absCorr: number; corr: number }[] = [];
-    const pairLimit = Math.min(numericCols.length, 8);
-    for (let ai = 0; ai < pairLimit; ai++) {
-      for (let bi = ai + 1; bi < pairLimit; bi++) {
-        const pairs = parseNumericPairs(ds, numericCols[ai], numericCols[bi]);
-        if (pairs.length < 5) continue;
-        const reg = regressionStatsFromPairs(pairs);
-        if (!reg) continue;
-        const sign = reg.slope >= 0 ? 1 : -1;
-        const corr = sign * Math.sqrt(reg.r2);
-        pairCorrs.push({ a: numericCols[ai], b: numericCols[bi], absCorr: Math.abs(corr), corr: Math.round(corr * 100) / 100 });
-      }
-    }
-    // Sort by absolute correlation, take top 4 (skip first since Chart 2 already shows it)
-    pairCorrs.sort((a, b) => b.absCorr - a.absCorr);
-    const topPairs = pairCorrs.slice(1, 5); // skip the #1 pair already shown in Chart 2
-
-    if (topPairs.length >= 2) {
-      // Create a multi-scatter with up to 4 sub-series
-      const scatterColors = ["rgba(78, 121, 167, 0.5)", "rgba(242, 142, 43, 0.5)", "rgba(225, 87, 89, 0.5)", "rgba(118, 183, 178, 0.5)"];
-      const scatterBorders = ["rgba(78, 121, 167, 1)", "rgba(242, 142, 43, 1)", "rgba(225, 87, 89, 1)", "rgba(118, 183, 178, 1)"];
-      const scatterDatasets = topPairs.map((pc, idx) => {
-        const points = parseNumericPairs(ds, pc.a, pc.b).slice(0, 200).map(([x, y]) => ({ x, y }));
-        const da = pc.a.length > 12 ? pc.a.slice(0, 10) + ".." : pc.a;
-        const db = pc.b.length > 12 ? pc.b.slice(0, 10) + ".." : pc.b;
+    const orderedKeys = Array.from(buckets.entries())
+      .sort((a, b) => (Number.isFinite(a[1].order) && Number.isFinite(b[1].order) ? a[1].order - b[1].order : a[0].localeCompare(b[0])))
+      .map(([k]) => k)
+      .slice(-60);
+    if (orderedKeys.length >= 3) {
+      const groupNames = trendGroupCol
+        ? orderCategoryKeys(Array.from(new Set(orderedKeys.flatMap(k => Array.from(buckets.get(k)!.byGroup.keys())))), g => orderedKeys.reduce((s, k) => s + (buckets.get(k)!.byGroup.get(g)?.length || 0), 0))
+        : ["All"];
+      const datasets = groupNames.slice(0, 5).map((group, index) => {
+        const cis = orderedKeys.map(k => {
+          const values = buckets.get(k)!.byGroup.get(group) || [];
+          return values.length ? meanConfidenceInterval(values) : null;
+        });
+        const round = (v: number | undefined) => (v === undefined || !Number.isFinite(v) ? null : roundSig(v));
         return {
-          label: `${da} vs ${db} (r=${pc.corr})`,
-          data: points,
-          backgroundColor: scatterColors[idx],
-          borderColor: scatterBorders[idx],
-          pointRadius: 2,
+          label: trendGroupCol ? `${displayName(trendGroupCol, 20)} = ${group}` : `Mean ${outcomeLabel}`,
+          data: cis.map(ci => round(ci?.mean)),
+          ciLower: cis.map(ci => (ci && ci.n >= 2 ? round(ci.low) : null)),
+          ciUpper: cis.map(ci => (ci && ci.n >= 2 ? round(ci.high) : null)),
+          borderColor: SERIES_COLORS[index % SERIES_COLORS.length],
         };
-      });
-
-      charts.push({
-        name: "pairwise_scatter",
-        description: `Pairwise scatter of top correlated variable pairs`,
-        config: {
-          type: "scatter",
-          data: { datasets: scatterDatasets },
-          options: {
-            plugins: { title: { display: true, text: "Pairwise Scatter (Top Correlations)", font: { size: 16 } } },
-          },
-        },
-      });
-    }
-  }
-
-  // Chart 11: Methodology applicability/readiness overview
-  if (methodAllowed(executableMethods, "data_visualisation")) {
-    const applicability = buildMethodApplicabilityAssessment(ds, numericCols, categoricalCols);
-    if (applicability.length > 0) {
-      const topMethods = applicability
-        .slice()
-        .sort((a, b) => b.readinessScore - a.readinessScore)
-        .slice(0, 10);
-      const labels = topMethods.map(item => item.label.length > 22 ? `${item.label.slice(0, 19)}...` : item.label);
-      const scores = topMethods.map(item => item.readinessScore);
-      const colors = topMethods.map(item => {
-        if (item.status === "executable_now") return "rgba(89, 161, 79, 0.75)";
-        if (item.status === "partially_ready") return "rgba(237, 201, 73, 0.8)";
-        return "rgba(225, 87, 89, 0.75)";
-      });
-
-      charts.push({
-        name: "method_applicability_overview",
-        description: "Readiness profile of major statistical methodologies (0-100 scale)",
-        config: {
-          type: "bar",
-          data: {
-            labels,
-            datasets: [{
-              label: "Method readiness (0-100)",
-              data: scores,
-              backgroundColor: colors,
-              borderColor: "rgba(68, 68, 68, 0.9)",
-              borderWidth: 1,
-            }],
-          },
-          options: {
-            plugins: {
-              title: {
-                display: true,
-                text: "Methodology Applicability Overview",
-                font: { size: 16 },
-              },
-            },
-            scales: {
-              y: {
-                min: 0,
-                max: 100,
-                title: { display: true, text: "Readiness score (0-100)" },
-              },
-              x: {
-                title: { display: true, text: "Methodology" },
-              },
+      }).filter(d => d.data.filter(v => v !== null).length >= 2);
+      if (datasets.length > 0) {
+        const timeLabel = displayName(timeCol);
+        push({
+          name: "time_trend",
+          description: `Trend in mean ${outcomeLabel} over ${timeLabel}${trendGroupCol ? ` by ${displayName(trendGroupCol)}` : ""}`,
+          caption: `Mean ${outcomeLabel} by ${timeLabel}${trendGroupCol ? `, separately by ${displayName(trendGroupCol)}` : ""}. Shaded bands are 95% confidence intervals for the period means.`,
+          section: "main",
+          config: {
+            type: "line",
+            data: { labels: orderedKeys, datasets },
+            options: {
+              plugins: { title: { display: true, text: `Mean ${outcomeLabel} over ${timeLabel}` } },
+              scales: { x: { title: { display: true, text: timeLabel } }, y: { title: { display: true, text: `Mean ${outcomeLabel}` } } },
             },
           },
-        },
-      });
-    }
-  }
-
-  // Chart 12: Stacked bar chart (proportional composition per category)
-  if (categoricalCols.length > 0 && numericCols.length >= 2 && methodAllowed(executableMethods, "group_comparison")) {
-    const catCol = categoricalCols[0];
-    const useCols = numericCols.slice(0, 4);
-    const groups: Record<string, Record<string, number[]>> = {};
-    for (const row of ds.data) {
-      const key = String(row[catCol] ?? "N/A").slice(0, 30);
-      if (!groups[key]) groups[key] = {};
-      for (const nc of useCols) {
-        if (!groups[key][nc]) groups[key][nc] = [];
-        const val = Number(row[nc]);
-        if (!isNaN(val)) groups[key][nc].push(val);
+        });
       }
     }
-    const sortedKeys = Object.keys(groups).sort().slice(0, 15);
-    const stackColors = ["rgba(78, 121, 167, 0.7)", "rgba(242, 142, 43, 0.7)", "rgba(225, 87, 89, 0.7)", "rgba(118, 183, 178, 0.7)"];
-    const stackBorders = ["rgba(78, 121, 167, 1)", "rgba(242, 142, 43, 1)", "rgba(225, 87, 89, 1)", "rgba(118, 183, 178, 1)"];
+  }
 
-    if (sortedKeys.length >= 2) {
-      const displayCatCol = catCol.length > 30 ? catCol.slice(0, 27) + "..." : catCol;
-
-      charts.push({
-        name: "stacked_bar",
-        description: `Stacked composition of ${useCols.length} variables by ${displayCatCol}`,
+  // ---------------------------------------------------------------- F8: standardised coefficients
+  if (robustOls && robustOls.regressorCols.length >= 2 && methodAllowed(executableMethods, "robust_ols")) {
+    const ySd = columnStandardDeviation(ds, robustOls.yCol);
+    const rows = robustOls.coefficients
+      .filter(c => c.name !== "intercept")
+      .map(c => {
+        const xSd = columnStandardDeviation(ds, c.name);
+        const scale = ySd > 0 && xSd > 0 ? xSd / ySd : NaN;
+        return { name: c.name, estimate: c.coefficient * scale, low: c.ciLower * scale, high: c.ciUpper * scale, p: c.pValue };
+      })
+      .filter(row => Number.isFinite(row.estimate) && Number.isFinite(row.low) && Number.isFinite(row.high));
+    if (rows.length >= 2) {
+      push({
+        name: "coefficient_forest_plot",
+        description: `Standardised multivariable OLS coefficients for ${displayName(robustOls.yCol)}`,
+        caption: `Standardised coefficients (change in SD of ${displayName(robustOls.yCol)} per SD change in each regressor) from the multivariable OLS model with ${robustOls.vcovType === "cluster" ? `standard errors clustered by ${robustOls.clusterCol || "entity"}` : "heteroskedasticity-robust (HC1) standard errors"} (n = ${formatCount(robustOls.n)}). Horizontal lines are 95% confidence intervals; the dashed line marks zero.`,
+        section: "main",
+        height: Math.max(360, Math.min(680, 150 + rows.length * 44)),
         config: {
-          type: "bar",
+          type: "forest",
           data: {
-            labels: sortedKeys,
-            datasets: useCols.map((nc, idx) => {
-              const displayNc = nc.length > 20 ? nc.slice(0, 17) + "..." : nc;
-              return {
-                label: `${displayNc}`,
-                data: sortedKeys.map(k => {
-                  const vals = (groups[k]?.[nc] || []).filter(v => !isNaN(v));
-                  return vals.length > 0 ? Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 100) / 100 : 0;
-                }),
-                backgroundColor: stackColors[idx % stackColors.length],
-                borderColor: stackBorders[idx % stackBorders.length],
-                borderWidth: 1,
-              };
-            }),
+            labels: rows.map(row => `${displayName(row.name, 30)}${significanceStars(row.p) ? ` ${significanceStars(row.p)}` : ""}`),
+            datasets: [{ label: "Standardised coefficient", data: rows.map(row => ({ estimate: roundSig(row.estimate), low: roundSig(row.low), high: roundSig(row.high) })), borderColor: FIGURE_COLORS.primary }],
           },
           options: {
-            plugins: { title: { display: true, text: `Stacked Composition by ${displayCatCol}`, font: { size: 16 } } },
-            scales: {
-              x: { stacked: true, title: { display: true, text: displayCatCol } },
-              y: { stacked: true, title: { display: true, text: "Mean value" } },
-            },
+            referenceLines: [{ axis: "x", value: 0 }],
+            plugins: { title: { display: true, text: `Standardised coefficients: ${displayName(robustOls.yCol)}` }, footnote: { text: "* p < 0.05, ** p < 0.01, *** p < 0.001" } },
+            scales: { x: { title: { display: true, text: "Standardised coefficient (95% CI)" } } },
           },
         },
       });
     }
   }
 
-  // Chart 13: Horizontal bar chart (better readability for many categories)
-  if (categoricalCols.length > 0 && numericCols.length > 0 && methodAllowed(executableMethods, "descriptive_statistics")) {
-    // Try to pick different columns from Chart 3 (category frequency); use second categorical or second numeric
-    const catCol = categoricalCols.length > 1 ? categoricalCols[1] : categoricalCols[0];
-    const numCol = numericCols.length > 1 ? numericCols[1] : numericCols[0];
-    const catGroups: Record<string, number[]> = {};
-    for (const row of ds.data) {
-      const key = String(row[catCol] ?? "N/A").slice(0, 30);
-      if (!catGroups[key]) catGroups[key] = [];
-      const val = Number(row[numCol]);
-      if (!isNaN(val)) catGroups[key].push(val);
-    }
-    const sortedEntries = Object.entries(catGroups)
-      .map(([k, vals]) => ({ label: k, mean: vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : 0 }))
-      .sort((a, b) => b.mean - a.mean)
-      .slice(0, 20);
-
-    if (sortedEntries.length >= 5) {
-      const displayCatCol = catCol.length > 30 ? catCol.slice(0, 27) + "..." : catCol;
-      const displayNumCol = numCol.length > 30 ? numCol.slice(0, 27) + "..." : numCol;
-
-      charts.push({
-        name: "horizontal_bar",
-        description: `Horizontal bar: mean ${displayNumCol} by ${displayCatCol}`,
-        config: {
-          type: "bar",
-          data: {
-            labels: sortedEntries.map(e => e.label),
-            datasets: [{
-              label: `Mean ${displayNumCol}`,
-              data: sortedEntries.map(e => Math.round(e.mean * 100) / 100),
-              backgroundColor: "rgba(89, 161, 79, 0.7)",
-              borderColor: "rgba(89, 161, 79, 1)",
-              borderWidth: 1,
-            }],
-          },
-          options: {
-            indexAxis: "y" as const,
-            plugins: { title: { display: true, text: `${displayNumCol} by ${displayCatCol}`, font: { size: 16 } } },
-            scales: {
-              x: { title: { display: true, text: displayNumCol } },
-              y: { title: { display: true, text: displayCatCol } },
-            },
-          },
-        },
-      });
-    }
-  }
-
-  if (methodAllowed(executableMethods, "data_visualisation")) {
-    const coefficientRows: Array<{ label: string; low: number; high: number }> = [];
+  // ---------------------------------------------------------------- F9: estimator comparison
+  {
+    const rows: Array<{ label: string; estimate: number; low: number; high: number }> = [];
     if (robustOls && methodAllowed(executableMethods, "robust_ols")) {
-      coefficientRows.push({
-        label: `Robust OLS: ${robustOls.yCol.length > 12 ? `${robustOls.yCol.slice(0, 10)}..` : robustOls.yCol}`,
-        low: Math.round(robustOls.ciLower * 1000) / 1000,
-        high: Math.round(robustOls.ciUpper * 1000) / 1000,
-      });
+      rows.push({ label: `OLS${robustOls.controlCols.length ? " + controls" : ""} (${robustOls.vcovType === "cluster" ? "clustered SE" : "HC1 SE"})`, estimate: robustOls.slope, low: robustOls.ciLower, high: robustOls.ciUpper });
     }
     if (panelFixedEffects && methodAllowed(executableMethods, "panel_fixed_effects")) {
-      coefficientRows.push({
-        label: `Panel FE: ${panelFixedEffects.yCol.length > 12 ? `${panelFixedEffects.yCol.slice(0, 10)}..` : panelFixedEffects.yCol}`,
-        low: Math.round((panelFixedEffects.beta - 1.96 * panelFixedEffects.se) * 1000) / 1000,
-        high: Math.round((panelFixedEffects.beta + 1.96 * panelFixedEffects.se) * 1000) / 1000,
-      });
+      const crit = studentTCritical(Math.max(1, (panelFixedEffects.clusterCount || panelFixedEffects.n) - 1));
+      rows.push({ label: "Two-way fixed effects", estimate: panelFixedEffects.beta, low: panelFixedEffects.beta - crit * panelFixedEffects.se, high: panelFixedEffects.beta + crit * panelFixedEffects.se });
     }
-    if (iv2Sls && methodAllowed(executableMethods, "iv_2sls")) {
-      coefficientRows.push({
-        label: `IV 2SLS: ${iv2Sls.yCol.length > 12 ? `${iv2Sls.yCol.slice(0, 10)}..` : iv2Sls.yCol}`,
-        low: Math.round(iv2Sls.ciLower * 1000) / 1000,
-        high: Math.round(iv2Sls.ciUpper * 1000) / 1000,
-      });
+    if (iv2Sls && methodAllowed(executableMethods, "iv_2sls")) rows.push({ label: "IV / 2SLS", estimate: iv2Sls.beta, low: iv2Sls.ciLower, high: iv2Sls.ciUpper });
+    if (rdd && methodAllowed(executableMethods, "regression_discontinuity")) rows.push({ label: "RDD (local linear)", estimate: rdd.estimate, low: rdd.estimate - 1.96 * rdd.se, high: rdd.estimate + 1.96 * rdd.se });
+    if (propensityScore && methodAllowed(executableMethods, "propensity_score")) rows.push({ label: "IPW (ATE)", estimate: propensityScore.ate, low: propensityScore.ciLower, high: propensityScore.ciUpper });
+    if (quantileRegression && methodAllowed(executableMethods, "quantile_regression")) {
+      const median = quantileRegression.estimates.find(e => Math.abs(e.tau - 0.5) < 1e-6);
+      if (median) rows.push({ label: "Median regression (tau = 0.5)", estimate: median.slope, low: median.ciLower, high: median.ciUpper });
     }
-    if (rdd && methodAllowed(executableMethods, "regression_discontinuity")) {
-      coefficientRows.push({
-        label: `RDD jump: ${rdd.outcomeCol.length > 12 ? `${rdd.outcomeCol.slice(0, 10)}..` : rdd.outcomeCol}`,
-        low: Math.round((rdd.estimate - 1.96 * rdd.se) * 1000) / 1000,
-        high: Math.round((rdd.estimate + 1.96 * rdd.se) * 1000) / 1000,
-      });
-    }
-    if (propensityScore && methodAllowed(executableMethods, "propensity_score")) {
-      coefficientRows.push({
-        label: `IPW ATE: ${propensityScore.outcomeCol.length > 12 ? `${propensityScore.outcomeCol.slice(0, 10)}..` : propensityScore.outcomeCol}`,
-        low: Math.round(propensityScore.ciLower * 1000) / 1000,
-        high: Math.round(propensityScore.ciUpper * 1000) / 1000,
-      });
-    }
-    if (coefficientRows.length > 0) {
-      charts.push({
+    const valid = rows.filter(row => [row.estimate, row.low, row.high].every(Number.isFinite));
+    const hasForest = charts.some(c => c.name === "coefficient_forest_plot");
+    if (valid.length >= 2 || (valid.length === 1 && !hasForest)) {
+      const effectOf = robustOls?.xCol || hints.primaryTreatmentCol || hints.primaryRegressorCol || "the primary regressor";
+      const scale = coefficientDisplayScale(ds, effectOf, valid.map(row => row.estimate));
+      for (const row of valid) {
+        row.estimate *= scale;
+        row.low *= scale;
+        row.high *= scale;
+      }
+      const unitNote = scale > 1 ? ` per ${formatCount(scale)} units of ${displayName(effectOf, 24)}` : "";
+      push({
         name: "coefficient_interval_plot",
-        description: "Coefficient interval plot for econometric estimators with 95% confidence intervals",
+        description: "Estimated effect of the primary regressor across estimators with 95% confidence intervals",
+        caption: `Estimated coefficient on ${displayName(effectOf)}${unitNote} for ${displayName(hints.primaryOutcomeCol || outcomeCol || "the outcome")} across ${valid.length} estimator${valid.length > 1 ? "s" : ""}. Points are point estimates and horizontal lines 95% confidence intervals. Estimators identify different estimands (conditional association, within-unit, local or weighted effects), so differences reflect design as well as sampling variation.`,
+        section: "main",
+        height: Math.max(320, Math.min(600, 160 + valid.length * 48)),
         config: {
-          type: "bar",
+          type: "forest",
           data: {
-            labels: coefficientRows.map(row => row.label),
-            datasets: [{
-              label: "95% confidence interval",
-              data: coefficientRows.map(row => [row.low, row.high]),
-              backgroundColor: "rgba(78, 121, 167, 0.45)",
-              borderColor: "rgba(78, 121, 167, 1)",
-              borderWidth: 1,
-            }],
+            labels: valid.map(row => row.label),
+            datasets: [{ label: "Estimate", data: valid.map(row => ({ estimate: roundSig(row.estimate), low: roundSig(row.low), high: roundSig(row.high) })), borderColor: FIGURE_COLORS.violet }],
           },
           options: {
-            indexAxis: "y" as const,
-            plugins: { title: { display: true, text: "Econometric Coefficient Intervals", font: { size: 16 } } },
-            scales: {
-              x: { title: { display: true, text: "Coefficient range" } },
-              y: { title: { display: true, text: "Estimator" } },
-            },
+            referenceLines: [{ axis: "x", value: 0 }],
+            plugins: { title: { display: true, text: `Effect of ${displayName(effectOf, 30)} across estimators` } },
+            scales: { x: { title: { display: true, text: `Coefficient${scale > 1 ? ` per ${formatCount(scale)} units` : ""} (units of ${displayName(hints.primaryOutcomeCol || outcomeCol || "outcome", 24)})` } } },
           },
         },
       });
     }
   }
 
-  if (robustOls && methodAllowed(executableMethods, "robust_ols")) {
-    const residualPoints = robustOls.fittedResiduals.slice(0, 200).map(point => ({
-      x: Math.round(point.fitted * 1000) / 1000,
-      y: Math.round(point.residual * 1000) / 1000,
-    }));
-    if (residualPoints.length >= 12) {
-      const fittedValues = residualPoints.map(point => point.x);
-      charts.push({
-        name: "residual_fitted_plot",
-        description: `Residual-versus-fitted diagnostic for robust OLS (${robustOls.yCol} on ${robustOls.xCol})`,
-        config: {
-          type: "scatter",
-          data: {
-            datasets: [
-              {
-                label: "Residuals",
-                data: residualPoints,
-                backgroundColor: "rgba(225, 87, 89, 0.55)",
-                borderColor: "rgba(225, 87, 89, 1)",
-                pointRadius: 3,
-              },
-              {
-                label: "Zero line",
-                data: [
-                  { x: Math.min(...fittedValues), y: 0 },
-                  { x: Math.max(...fittedValues), y: 0 },
-                ],
-                showLine: true,
-                pointRadius: 0,
-                borderColor: "rgba(68, 68, 68, 0.9)",
-                borderWidth: 1.5,
-                borderDash: [5, 3],
-              },
-            ],
-          },
-          options: {
-            plugins: { title: { display: true, text: "Residual vs Fitted Diagnostic", font: { size: 16 } } },
-            scales: {
-              x: { title: { display: true, text: "Fitted value" } },
-              y: { title: { display: true, text: "Residual" } },
-            },
-          },
-        },
-      });
-    }
-  }
-
+  // ---------------------------------------------------------------- causal design figures
   if (diffInDiff && methodAllowed(executableMethods, "diff_in_diff")) {
-    charts.push({
+    const startLabel = diffInDiff.series.find(point => point.relIndex === 0)?.label;
+    push({
       name: "parallel_trends_plot",
-      description: `Parallel-trends style group means for ${diffInDiff.outcomeCol} around the treatment window`,
+      description: `Treated and control group means of ${diffInDiff.outcomeCol} around the treatment onset`,
+      caption: `Mean ${displayName(diffInDiff.outcomeCol)} for treated and control units by ${displayName(diffInDiff.timeCol)}. The dashed vertical line marks the first treated period; similar pre-treatment slopes support the parallel-trends assumption behind the difference-in-differences estimate (${formatNumber(diffInDiff.estimate)}).`,
+      section: "main",
       config: {
         type: "line",
         data: {
           labels: diffInDiff.series.map(point => point.label),
           datasets: [
-            {
-              label: "Treated mean",
-              data: diffInDiff.series.map(point => Math.round(point.treatedMean * 1000) / 1000),
-              borderColor: "rgba(78, 121, 167, 1)",
-              backgroundColor: "rgba(78, 121, 167, 0.12)",
-              tension: 0.15,
-            },
-            {
-              label: "Control mean",
-              data: diffInDiff.series.map(point => Math.round(point.controlMean * 1000) / 1000),
-              borderColor: "rgba(242, 142, 43, 1)",
-              backgroundColor: "rgba(242, 142, 43, 0.12)",
-              tension: 0.15,
-            },
+            { label: "Treated", data: diffInDiff.series.map(point => roundSig(point.treatedMean)), borderColor: FIGURE_COLORS.primary },
+            { label: "Control", data: diffInDiff.series.map(point => roundSig(point.controlMean)), borderColor: FIGURE_COLORS.secondary },
           ],
         },
         options: {
-          plugins: { title: { display: true, text: "Parallel Trends Diagnostic", font: { size: 16 } } },
-          scales: {
-            x: { title: { display: true, text: diffInDiff.timeCol } },
-            y: { title: { display: true, text: diffInDiff.outcomeCol } },
-          },
+          referenceLines: startLabel ? [{ axis: "x", value: startLabel, label: "Treatment onset" }] : [],
+          plugins: { title: { display: true, text: "Treated vs control means (parallel trends)" } },
+          scales: { x: { title: { display: true, text: displayName(diffInDiff.timeCol) } }, y: { title: { display: true, text: `Mean ${displayName(diffInDiff.outcomeCol)}` } } },
         },
       },
     });
   }
 
   if (diffInDiff && methodAllowed(executableMethods, "event_study")) {
-    charts.push({
+    const labels = diffInDiff.series.map(point => String(point.relIndex));
+    push({
       name: "event_study_plot",
-      description: `Event-study profile for ${diffInDiff.outcomeCol} relative to the pre-treatment baseline`,
+      description: `Event-study profile of ${diffInDiff.outcomeCol} relative to the pre-treatment baseline`,
+      caption: `Event-study profile: treated-minus-control difference in mean ${displayName(diffInDiff.outcomeCol)} in each period relative to treatment onset, normalised to the pre-treatment baseline. Leads (negative periods) near zero are consistent with no anticipation or pre-trends.`,
+      section: "main",
       config: {
         type: "line",
         data: {
-          labels: diffInDiff.series.map(point => String(point.relIndex)),
-          datasets: [
-            {
-              label: "Relative effect",
-              data: diffInDiff.series.map(point => Math.round(point.effect * 1000) / 1000),
-              borderColor: "rgba(89, 161, 79, 1)",
-              backgroundColor: "rgba(89, 161, 79, 0.14)",
-              tension: 0.12,
-            },
-            {
-              label: "Zero line",
-              data: diffInDiff.series.map(() => 0),
-              borderColor: "rgba(68, 68, 68, 0.9)",
-              borderWidth: 1.2,
-              borderDash: [5, 3],
-              pointRadius: 0,
-            },
-          ],
+          labels,
+          datasets: [{ label: "Relative effect", data: diffInDiff.series.map(point => roundSig(point.effect)), borderColor: FIGURE_COLORS.tertiary }],
         },
         options: {
-          plugins: { title: { display: true, text: "Event Study Profile", font: { size: 16 } } },
-          scales: {
-            x: { title: { display: true, text: "Relative period" } },
-            y: { title: { display: true, text: "Effect vs baseline" } },
-          },
+          referenceLines: [{ axis: "y", value: 0 }, ...(labels.includes("0") ? [{ axis: "x", value: "0", label: "Onset" }] : [])],
+          plugins: { title: { display: true, text: "Event-study profile" } },
+          scales: { x: { title: { display: true, text: "Periods relative to treatment" } }, y: { title: { display: true, text: "Difference vs baseline" } } },
         },
       },
     });
   }
 
   if (syntheticControl && methodAllowed(executableMethods, "synthetic_control")) {
-    charts.push({
+    const onset = syntheticControl.series.find(point => point.relIndex === 0)?.label;
+    const refs = onset ? [{ axis: "x", value: onset, label: "Treatment" }] : [];
+    push({
       name: "synthetic_control_path",
       description: `Observed versus synthetic trajectory for ${syntheticControl.treatedUnit}`,
+      caption: `Observed ${displayName(syntheticControl.outcomeCol)} for ${syntheticControl.treatedUnit} and its synthetic control built from ${syntheticControl.donorCount} donor units (pre-treatment RMSE = ${formatNumber(syntheticControl.preRmse)}).`,
+      section: "main",
       config: {
         type: "line",
         data: {
           labels: syntheticControl.series.map(point => point.label),
           datasets: [
-            {
-              label: `Observed: ${syntheticControl.treatedUnit}`,
-              data: syntheticControl.series.map(point => Math.round(point.treated * 1000) / 1000),
-              borderColor: "rgba(78, 121, 167, 1)",
-              backgroundColor: "rgba(78, 121, 167, 0.1)",
-              tension: 0.12,
-            },
-            {
-              label: "Synthetic control",
-              data: syntheticControl.series.map(point => Math.round(point.synthetic * 1000) / 1000),
-              borderColor: "rgba(225, 87, 89, 1)",
-              backgroundColor: "rgba(225, 87, 89, 0.08)",
-              tension: 0.12,
-            },
+            { label: `Observed: ${syntheticControl.treatedUnit}`, data: syntheticControl.series.map(point => roundSig(point.treated)), borderColor: FIGURE_COLORS.primary },
+            { label: "Synthetic control", data: syntheticControl.series.map(point => roundSig(point.synthetic)), borderColor: FIGURE_COLORS.accent, borderDash: [6, 4] },
           ],
         },
         options: {
-          plugins: { title: { display: true, text: "Synthetic Control Trajectory", font: { size: 16 } } },
-          scales: {
-            x: { title: { display: true, text: syntheticControl.timeCol } },
-            y: { title: { display: true, text: syntheticControl.outcomeCol } },
-          },
+          referenceLines: refs,
+          plugins: { title: { display: true, text: "Synthetic control: observed vs synthetic" } },
+          scales: { x: { title: { display: true, text: displayName(syntheticControl.timeCol) } }, y: { title: { display: true, text: displayName(syntheticControl.outcomeCol) } } },
         },
       },
     });
-
-    charts.push({
+    push({
       name: "synthetic_control_gap",
-      description: `Gap plot for ${syntheticControl.treatedUnit} minus its synthetic control`,
+      description: `Gap between ${syntheticControl.treatedUnit} and its synthetic control`,
+      caption: `Difference between observed and synthetic ${displayName(syntheticControl.outcomeCol)} for ${syntheticControl.treatedUnit}; the mean post-treatment gap is ${formatNumber(syntheticControl.attPostMean)}.`,
+      section: "diagnostic",
       config: {
         type: "line",
         data: {
           labels: syntheticControl.series.map(point => point.label),
-          datasets: [
-            {
-              label: "Gap",
-              data: syntheticControl.series.map(point => Math.round(point.gap * 1000) / 1000),
-              borderColor: "rgba(118, 183, 178, 1)",
-              backgroundColor: "rgba(118, 183, 178, 0.14)",
-              tension: 0.12,
-            },
-            {
-              label: "Zero line",
-              data: syntheticControl.series.map(() => 0),
-              borderColor: "rgba(68, 68, 68, 0.9)",
-              borderWidth: 1.2,
-              borderDash: [5, 3],
-              pointRadius: 0,
-            },
-          ],
+          datasets: [{ label: "Gap", data: syntheticControl.series.map(point => roundSig(point.gap)), borderColor: FIGURE_COLORS.tertiary }],
         },
         options: {
-          plugins: { title: { display: true, text: "Synthetic Control Gap Plot", font: { size: 16 } } },
-          scales: {
-            x: { title: { display: true, text: syntheticControl.timeCol } },
-            y: { title: { display: true, text: "Observed - synthetic" } },
-          },
+          referenceLines: [{ axis: "y", value: 0 }, ...refs],
+          plugins: { title: { display: true, text: "Synthetic control gap" } },
+          scales: { x: { title: { display: true, text: displayName(syntheticControl.timeCol) } }, y: { title: { display: true, text: "Observed - synthetic" } } },
         },
       },
     });
-
-    const topWeights = syntheticControl.weights.slice(0, 8);
+    const topWeights = syntheticControl.weights.filter(item => item.weight > 0.001).slice(0, 10);
     if (topWeights.length > 0) {
-      charts.push({
+      push({
         name: "synthetic_control_weights",
         description: `Donor weights for the synthetic control of ${syntheticControl.treatedUnit}`,
+        caption: `Donor-unit weights defining the synthetic control for ${syntheticControl.treatedUnit} (weights are non-negative and sum to one; units with weight < 0.001 omitted).`,
+        section: "diagnostic",
+        height: Math.max(320, Math.min(600, 150 + topWeights.length * 34)),
         config: {
           type: "bar",
-          data: {
-            labels: topWeights.map(item => item.unit.length > 16 ? `${item.unit.slice(0, 13)}...` : item.unit),
-            datasets: [{
-              label: "Weight",
-              data: topWeights.map(item => Math.round(item.weight * 1000) / 1000),
-              backgroundColor: "rgba(237, 201, 73, 0.75)",
-              borderColor: "rgba(237, 201, 73, 1)",
-              borderWidth: 1,
-            }],
-          },
+          data: { labels: topWeights.map(item => item.unit), datasets: [{ label: "Weight", data: topWeights.map(item => Math.round(item.weight * 1000) / 1000), backgroundColor: FIGURE_COLORS.quaternary }] },
           options: {
-            indexAxis: "y" as const,
-            plugins: { title: { display: true, text: "Synthetic Control Donor Weights", font: { size: 16 } } },
-            scales: {
-              x: { title: { display: true, text: "Weight" } },
-              y: { title: { display: true, text: "Donor unit" } },
-            },
+            indexAxis: "y",
+            plugins: { title: { display: true, text: "Synthetic control donor weights" }, valueLabels: { decimals: 3 } },
+            scales: { x: { min: 0, title: { display: true, text: "Weight" } }, y: { title: { display: true, text: "Donor unit" } } },
           },
         },
       });
@@ -6635,28 +6343,23 @@ export function generateDefaultCharts(
   }
 
   if (syntheticControlPlacebos && methodAllowed(executableMethods, "synthetic_control")) {
-    const placeboBars = syntheticControlPlacebos.ratios.slice(0, 10);
-    charts.push({
+    const placeboBars = syntheticControlPlacebos.ratios.slice().sort((a, b) => b.ratio - a.ratio).slice(0, 12);
+    push({
       name: "synthetic_control_placebo_rmspe",
-      description: `Placebo RMSPE ratios for synthetic control around ${syntheticControlPlacebos.treatedUnit}`,
+      description: `Placebo post/pre RMSPE ratios around ${syntheticControlPlacebos.treatedUnit}`,
+      caption: `Post- to pre-treatment RMSPE ratios from in-space placebo tests; the treated unit (${syntheticControlPlacebos.treatedUnit}, highlighted) ranks ${syntheticControlPlacebos.actualRank} of ${syntheticControlPlacebos.ratios.length}.`,
+      section: "diagnostic",
+      height: Math.max(320, Math.min(620, 150 + placeboBars.length * 32)),
       config: {
         type: "bar",
         data: {
-          labels: placeboBars.map(item => item.unit.length > 16 ? `${item.unit.slice(0, 13)}...` : item.unit),
-          datasets: [{
-            label: "Post / pre RMSPE",
-            data: placeboBars.map(item => Math.round(item.ratio * 1000) / 1000),
-            backgroundColor: placeboBars.map(item => item.isActual ? "rgba(225, 87, 89, 0.8)" : "rgba(78, 121, 167, 0.65)"),
-            borderColor: placeboBars.map(item => item.isActual ? "rgba(225, 87, 89, 1)" : "rgba(78, 121, 167, 1)"),
-            borderWidth: 1,
-          }],
+          labels: placeboBars.map(item => item.unit),
+          datasets: [{ label: "Post / pre RMSPE", data: placeboBars.map(item => Math.round(item.ratio * 1000) / 1000), backgroundColor: placeboBars.map(item => (item.isActual ? FIGURE_COLORS.accent : FIGURE_COLORS.neutral)) }],
         },
         options: {
-          plugins: { title: { display: true, text: "Synthetic Control Placebo RMSPE Ratios", font: { size: 16 } } },
-          scales: {
-            x: { title: { display: true, text: "Pseudo-treated unit" } },
-            y: { title: { display: true, text: "Post / pre RMSPE" } },
-          },
+          indexAxis: "y",
+          plugins: { title: { display: true, text: "Placebo RMSPE ratios" } },
+          scales: { x: { title: { display: true, text: "Post / pre RMSPE ratio" } }, y: { title: { display: true, text: "Unit" } } },
         },
       },
     });
@@ -6665,41 +6368,25 @@ export function generateDefaultCharts(
   if (iv2Sls && methodAllowed(executableMethods, "iv_2sls")) {
     const firstStageLine = regressionStatsFromPairs(iv2Sls.firstStagePoints.map(point => [point.x, point.y] as [number, number]));
     if (firstStageLine) {
-      const xMin = Math.min(...iv2Sls.firstStagePoints.map(point => point.x));
-      const xMax = Math.max(...iv2Sls.firstStagePoints.map(point => point.x));
-      charts.push({
+      const xs = iv2Sls.firstStagePoints.map(point => point.x);
+      const xMin = Math.min(...xs);
+      const xMax = Math.max(...xs);
+      push({
         name: "iv_first_stage_plot",
-        description: `First-stage relevance plot for instrument ${iv2Sls.zCol} and treatment ${iv2Sls.xCol}`,
+        description: `First-stage relevance of instrument ${iv2Sls.zCol} for ${iv2Sls.xCol}`,
+        caption: `First stage of the IV design: ${displayName(iv2Sls.xCol)} against the instrument ${displayName(iv2Sls.zCol)} with the least-squares fit (first-stage F = ${formatNumber(iv2Sls.firstStageF)}; values above 10 indicate a strong instrument).`,
+        section: "diagnostic",
         config: {
           type: "scatter",
           data: {
             datasets: [
-              {
-                label: "Observed first stage",
-                data: iv2Sls.firstStagePoints.slice(0, 200),
-                backgroundColor: "rgba(78, 121, 167, 0.55)",
-                borderColor: "rgba(78, 121, 167, 1)",
-                pointRadius: 3,
-              },
-              {
-                label: "First-stage fit",
-                data: [
-                  { x: xMin, y: firstStageLine.intercept + firstStageLine.slope * xMin },
-                  { x: xMax, y: firstStageLine.intercept + firstStageLine.slope * xMax },
-                ],
-                showLine: true,
-                pointRadius: 0,
-                borderColor: "rgba(225, 87, 89, 1)",
-                borderWidth: 2,
-              },
+              { label: "Observations", data: iv2Sls.firstStagePoints.slice(0, 1500), backgroundColor: FIGURE_COLORS.primary },
+              { label: "First-stage fit", data: [{ x: xMin, y: firstStageLine.intercept + firstStageLine.slope * xMin }, { x: xMax, y: firstStageLine.intercept + firstStageLine.slope * xMax }], showLine: true, pointRadius: 0, borderColor: FIGURE_COLORS.accent },
             ],
           },
           options: {
-            plugins: { title: { display: true, text: "IV First-Stage Relevance", font: { size: 16 } } },
-            scales: {
-              x: { title: { display: true, text: iv2Sls.zCol } },
-              y: { title: { display: true, text: iv2Sls.xCol } },
-            },
+            plugins: { title: { display: true, text: "IV first stage" }, subtitle: { text: `First-stage F = ${formatNumber(iv2Sls.firstStageF)}` } },
+            scales: { x: { title: { display: true, text: displayName(iv2Sls.zCol) } }, y: { title: { display: true, text: displayName(iv2Sls.xCol) } } },
           },
         },
       });
@@ -6711,64 +6398,25 @@ export function generateDefaultCharts(
     const rightBins = rdd.bins.filter(point => point.side === "right").map(point => ({ x: point.x, y: point.y }));
     const fitLeft = rdd.fitLine.filter(point => point.side === "left").map(point => ({ x: point.x, y: point.y }));
     const fitRight = rdd.fitLine.filter(point => point.side === "right").map(point => ({ x: point.x, y: point.y }));
-    const yValues = rdd.bins.map(point => point.y);
-    charts.push({
+    push({
       name: "rdd_plot",
-      description: `RDD local-linear plot for ${rdd.outcomeCol} around cutoff ${Math.round(rdd.cutoff * 1000) / 1000}`,
+      description: `Regression-discontinuity plot for ${rdd.outcomeCol} at cutoff ${formatNumber(rdd.cutoff)}`,
+      caption: `Binned means of ${displayName(rdd.outcomeCol)} against the running variable ${displayName(rdd.runningCol)} with separate local-linear fits on each side of the cutoff (${formatNumber(rdd.cutoff)}, bandwidth ${formatNumber(rdd.bandwidth)}). The estimated discontinuity is ${formatNumber(rdd.estimate)} (SE ${formatNumber(rdd.se)}).`,
+      section: "main",
       config: {
         type: "scatter",
         data: {
           datasets: [
-            {
-              label: "Left-of-cutoff bins",
-              data: leftBins,
-              backgroundColor: "rgba(78, 121, 167, 0.7)",
-              borderColor: "rgba(78, 121, 167, 1)",
-              pointRadius: 4,
-            },
-            {
-              label: "Right-of-cutoff bins",
-              data: rightBins,
-              backgroundColor: "rgba(225, 87, 89, 0.7)",
-              borderColor: "rgba(225, 87, 89, 1)",
-              pointRadius: 4,
-            },
-            {
-              label: "Left fit",
-              data: fitLeft,
-              showLine: true,
-              pointRadius: 0,
-              borderColor: "rgba(78, 121, 167, 1)",
-              borderWidth: 2,
-            },
-            {
-              label: "Right fit",
-              data: fitRight,
-              showLine: true,
-              pointRadius: 0,
-              borderColor: "rgba(225, 87, 89, 1)",
-              borderWidth: 2,
-            },
-            {
-              label: "Cutoff",
-              data: [
-                { x: rdd.cutoff, y: Math.min(...yValues) },
-                { x: rdd.cutoff, y: Math.max(...yValues) },
-              ],
-              showLine: true,
-              pointRadius: 0,
-              borderColor: "rgba(68, 68, 68, 0.9)",
-              borderWidth: 1.2,
-              borderDash: [5, 3],
-            },
+            { label: "Below cutoff (binned means)", data: leftBins, backgroundColor: FIGURE_COLORS.primary, pointRadius: 4 },
+            { label: "Above cutoff (binned means)", data: rightBins, backgroundColor: FIGURE_COLORS.secondary, pointRadius: 4 },
+            { label: "Local linear fit", data: fitLeft, showLine: true, pointRadius: 0, borderColor: FIGURE_COLORS.primary },
+            { label: "Local linear fit (right)", data: fitRight, showLine: true, pointRadius: 0, borderColor: FIGURE_COLORS.secondary, hideInLegend: true },
           ],
         },
         options: {
-          plugins: { title: { display: true, text: "Regression Discontinuity Plot", font: { size: 16 } } },
-          scales: {
-            x: { title: { display: true, text: rdd.runningCol } },
-            y: { title: { display: true, text: rdd.outcomeCol } },
-          },
+          referenceLines: [{ axis: "x", value: rdd.cutoff, label: "Cutoff" }],
+          plugins: { title: { display: true, text: "Regression discontinuity" } },
+          scales: { x: { title: { display: true, text: displayName(rdd.runningCol) } }, y: { title: { display: true, text: displayName(rdd.outcomeCol) } } },
         },
       },
     });
@@ -6783,111 +6431,230 @@ export function generateDefaultCharts(
       if (row.treatment === 1) treatedBins[index]++;
       else controlBins[index]++;
     }
+    const treatedTotal = treatedBins.reduce((a, b) => a + b, 0) || 1;
+    const controlTotal = controlBins.reduce((a, b) => a + b, 0) || 1;
     const labels = Array.from({ length: binCount }, (_, index) => `${(index / binCount).toFixed(1)}-${((index + 1) / binCount).toFixed(1)}`);
-    charts.push({
+    push({
       name: "propensity_overlap_plot",
-      description: `Propensity-score overlap diagnostic for ${propensityScore.treatmentCol}`,
+      description: `Propensity-score overlap for ${propensityScore.treatmentCol}`,
+      caption: `Distribution of estimated propensity scores for treated and control units (share of each group per score bin). Substantial overlap across bins supports the common-support assumption required for inverse-probability weighting.`,
+      section: "diagnostic",
       config: {
         type: "bar",
         data: {
           labels,
           datasets: [
-            {
-              label: "Treated",
-              data: treatedBins,
-              backgroundColor: "rgba(78, 121, 167, 0.65)",
-              borderColor: "rgba(78, 121, 167, 1)",
-              borderWidth: 1,
-            },
-            {
-              label: "Control",
-              data: controlBins,
-              backgroundColor: "rgba(242, 142, 43, 0.65)",
-              borderColor: "rgba(242, 142, 43, 1)",
-              borderWidth: 1,
-            },
+            { label: "Treated", data: treatedBins.map(c => Math.round((c / treatedTotal) * 1000) / 10), backgroundColor: FIGURE_COLORS.primary },
+            { label: "Control", data: controlBins.map(c => Math.round((c / controlTotal) * 1000) / 10), backgroundColor: FIGURE_COLORS.secondary },
           ],
         },
         options: {
-          plugins: { title: { display: true, text: "Propensity Score Overlap", font: { size: 16 } } },
-          scales: {
-            x: { title: { display: true, text: "Propensity-score bin" } },
-            y: { title: { display: true, text: "Count" } },
-          },
+          plugins: { title: { display: true, text: "Propensity score overlap" } },
+          scales: { x: { title: { display: true, text: "Estimated propensity score" } }, y: { title: { display: true, text: "Share of group (%)" } } },
         },
       },
     });
 
-    const topBalance = propensityScore.balance
-      .slice()
-      .sort((a, b) => Math.abs(b.smdBefore) - Math.abs(a.smdBefore))
-      .slice(0, 8);
-    charts.push({
-      name: "love_plot",
-      description: `Love plot of absolute standardised mean differences before and after weighting`,
-      config: {
-        type: "line",
-        data: {
-          labels: topBalance.map(item => item.covariate.length > 18 ? `${item.covariate.slice(0, 15)}...` : item.covariate),
-          datasets: [
-            {
-              label: "Before weighting",
-              data: topBalance.map(item => Math.round(Math.abs(item.smdBefore) * 1000) / 1000),
-              borderColor: "rgba(225, 87, 89, 1)",
-              backgroundColor: "rgba(225, 87, 89, 0.15)",
-              pointRadius: 4,
-              tension: 0,
-            },
-            {
-              label: "After weighting",
-              data: topBalance.map(item => Math.round(Math.abs(item.smdAfter) * 1000) / 1000),
-              borderColor: "rgba(89, 161, 79, 1)",
-              backgroundColor: "rgba(89, 161, 79, 0.15)",
-              pointRadius: 4,
-              tension: 0,
-            },
-          ],
-        },
-        options: {
-          plugins: { title: { display: true, text: "Covariate Balance Love Plot", font: { size: 16 } } },
-          scales: {
-            x: { title: { display: true, text: "Covariate" } },
-            y: { title: { display: true, text: "|Standardised mean difference|" } },
+    const topBalance = propensityScore.balance.slice().sort((a, b) => Math.abs(b.smdBefore) - Math.abs(a.smdBefore)).slice(0, 12);
+    if (topBalance.length > 0) {
+      push({
+        name: "love_plot",
+        description: "Covariate balance before and after inverse-probability weighting",
+        caption: "Absolute standardised mean differences between treated and control units before and after inverse-probability weighting; values below 0.1 (dashed line) are conventionally regarded as balanced.",
+        section: "diagnostic",
+        height: Math.max(340, Math.min(640, 160 + topBalance.length * 40)),
+        config: {
+          type: "forest",
+          data: {
+            labels: topBalance.map(item => item.covariate),
+            datasets: [
+              { label: "Before weighting", data: topBalance.map(item => Math.round(Math.abs(item.smdBefore) * 1000) / 1000), borderColor: FIGURE_COLORS.accent },
+              { label: "After weighting", data: topBalance.map(item => Math.round(Math.abs(item.smdAfter) * 1000) / 1000), borderColor: FIGURE_COLORS.tertiary },
+            ],
+          },
+          options: {
+            referenceLines: [{ axis: "x", value: 0.1, label: "0.1" }],
+            plugins: { title: { display: true, text: "Covariate balance (love plot)" } },
+            scales: { x: { min: 0, title: { display: true, text: "|Standardised mean difference|" } } },
           },
         },
-      },
-    });
+      });
+    }
   }
 
   if (quantileRegression && methodAllowed(executableMethods, "quantile_regression")) {
-    charts.push({
+    const qScale = coefficientDisplayScale(ds, quantileRegression.xCol, quantileRegression.estimates.map(estimate => estimate.slope));
+    const refs: Array<{ axis: "x" | "y"; value: number; label?: string }> = robustOls && robustOls.xCol === quantileRegression.xCol && robustOls.yCol === quantileRegression.yCol
+      ? [{ axis: "y", value: roundSig(robustOls.slope * qScale), label: "OLS estimate" }]
+      : [{ axis: "y", value: 0 }];
+    push({
       name: "quantile_regression_profile",
-      description: `Slope profile across conditional quantiles for ${quantileRegression.yCol}`,
+      description: `Quantile-regression slope profile for ${quantileRegression.yCol}`,
+      caption: `Coefficient on ${displayName(quantileRegression.xCol)} across conditional quantiles of ${displayName(quantileRegression.yCol)} (n = ${formatCount(quantileRegression.n)}); the shaded band is the bootstrap 95% confidence interval${refs[0].label ? " and the dashed line the OLS (mean) estimate" : ""}.`,
+      section: "main",
       config: {
         type: "line",
         data: {
           labels: quantileRegression.estimates.map(estimate => estimate.tau.toFixed(2)),
           datasets: [{
-            label: `Slope of ${quantileRegression.yCol} on ${quantileRegression.xCol}`,
-            data: quantileRegression.estimates.map(estimate => Math.round(estimate.slope * 1000) / 1000),
-            borderColor: "rgba(118, 183, 178, 1)",
-            backgroundColor: "rgba(118, 183, 178, 0.15)",
-            pointRadius: 4,
-            tension: 0,
+            label: `Slope on ${displayName(quantileRegression.xCol, 24)}`,
+            data: quantileRegression.estimates.map(estimate => roundSig(estimate.slope * qScale)),
+            ciLower: quantileRegression.estimates.map(estimate => roundSig(estimate.ciLower * qScale)),
+            ciUpper: quantileRegression.estimates.map(estimate => roundSig(estimate.ciUpper * qScale)),
+            borderColor: FIGURE_COLORS.tertiary,
           }],
         },
         options: {
-          plugins: { title: { display: true, text: "Quantile Regression Coefficient Profile", font: { size: 16 } } },
-          scales: {
-            x: { title: { display: true, text: "Quantile (tau)" } },
-            y: { title: { display: true, text: "Slope" } },
-          },
+          referenceLines: refs,
+          plugins: { title: { display: true, text: "Quantile regression coefficient profile" } },
+          scales: { x: { title: { display: true, text: "Quantile (tau)" } }, y: { title: { display: true, text: qScale > 1 ? `Coefficient per ${formatCount(qScale)} units` : "Coefficient" } } },
         },
       },
     });
   }
 
-  return charts;
+  // ---------------------------------------------------------------- diagnostics
+  if (robustOls && methodAllowed(executableMethods, "robust_ols")) {
+    const residualPoints = robustOls.fittedResiduals.slice(0, 1500).map(point => ({
+      x: roundSig(point.fitted),
+      y: roundSig(point.residual),
+    }));
+    if (residualPoints.length >= 12) {
+      push({
+        name: "residual_fitted_plot",
+        description: `Residuals versus fitted values for the OLS model of ${robustOls.yCol}`,
+        caption: `Residuals against fitted values from the OLS model of ${displayName(robustOls.yCol)}. A patternless band around zero supports linearity; funnel shapes indicate heteroskedasticity (addressed with robust standard errors).`,
+        section: "diagnostic",
+        config: {
+          type: "scatter",
+          data: { datasets: [{ label: "Residuals", data: residualPoints, backgroundColor: FIGURE_COLORS.primary, pointRadius: residualPoints.length > 600 ? 2.2 : 3 }] },
+          options: {
+            referenceLines: [{ axis: "y", value: 0 }],
+            plugins: { title: { display: true, text: "Residuals vs fitted values" } },
+            scales: { x: { title: { display: true, text: "Fitted value" } }, y: { title: { display: true, text: "Residual" } } },
+          },
+        },
+      });
+    }
+  }
+
+  if (methodAllowed(executableMethods, "descriptive_statistics")) {
+    const missingRows = ds.columns
+      .map(col => {
+        let missing = 0;
+        for (const row of ds.data) if (isMissingValue(row[col])) missing++;
+        return { col, pct: (missing / Math.max(1, ds.data.length)) * 100 };
+      })
+      .filter(item => item.pct > 0)
+      .sort((a, b) => b.pct - a.pct)
+      .slice(0, 15);
+    if (missingRows.length > 0 && missingRows[0].pct >= 1) {
+      push({
+        name: "missing_data_profile",
+        description: "Share of missing values by variable",
+        caption: `Percentage of missing values for the ${missingRows.length} variables with incomplete data (N = ${formatCount(ds.data.length)} rows analysed). Missing data are handled by ${bundle.missingDataMode === "mean_imputation" ? "mean imputation of predictors" : "complete-case analysis"} in the regression models.`,
+        section: "diagnostic",
+        height: Math.max(320, Math.min(620, 150 + missingRows.length * 30)),
+        config: {
+          type: "bar",
+          data: { labels: missingRows.map(item => item.col), datasets: [{ label: "Missing (%)", data: missingRows.map(item => Math.round(item.pct * 10) / 10), backgroundColor: FIGURE_COLORS.neutral }] },
+          options: {
+            indexAxis: "y",
+            plugins: { title: { display: true, text: "Missing data by variable" }, valueLabels: { decimals: 1, suffix: "%" } },
+            scales: { x: { min: 0, title: { display: true, text: "Missing values (%)" } }, y: { title: { display: true, text: "Variable" } } },
+          },
+        },
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------- cross-tab composition
+  if (groupCol && methodAllowed(executableMethods, "descriptive_statistics")) {
+    const secondCol = chooseGroupingColumn(ds, bundle, [groupCol], analysisTopic);
+    if (secondCol && secondCol !== groupCol) {
+      const rowLevels = Array.from(categoryCounts(ds, groupCol).entries()).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([k]) => k);
+      const segLevels = Array.from(categoryCounts(ds, secondCol).entries()).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k]) => k);
+      if (rowLevels.length >= 2 && segLevels.length >= 2) {
+        const table = new Map<string, Map<string, number>>();
+        for (const row of ds.data) {
+          const a = categoryKey(row[groupCol]);
+          const b = categoryKey(row[secondCol]);
+          if (a === null || b === null || !rowLevels.includes(a) || !segLevels.includes(b)) continue;
+          const inner = table.get(a) || new Map<string, number>();
+          inner.set(b, (inner.get(b) || 0) + 1);
+          table.set(a, inner);
+        }
+        const totals = rowLevels.map(level => Array.from(table.get(level)?.values() || []).reduce((s, v) => s + v, 0));
+        if (totals.every(total => total > 0)) {
+          push({
+            name: "composition_stacked_bar",
+            description: `Composition of ${secondCol} within each level of ${groupCol}`,
+            caption: `Distribution of ${displayName(secondCol)} within each category of ${displayName(groupCol)} (row percentages; each bar sums to 100%).`,
+            section: "descriptive",
+            height: Math.max(340, Math.min(620, 170 + rowLevels.length * 36)),
+            config: {
+              type: "bar",
+              data: {
+                labels: rowLevels,
+                datasets: segLevels.map((segment, index) => ({
+                  label: `${displayName(secondCol, 18)} = ${segment}`,
+                  data: rowLevels.map((level, i) => Math.round(((table.get(level)?.get(segment) || 0) / totals[i]) * 1000) / 10),
+                  backgroundColor: SERIES_COLORS[index % SERIES_COLORS.length],
+                })),
+              },
+              options: {
+                indexAxis: "y",
+                plugins: { title: { display: true, text: `${displayName(secondCol)} by ${displayName(groupCol)}` } },
+                scales: { x: { stacked: true, min: 0, max: 100, title: { display: true, text: "Row percentage (%)" } }, y: { stacked: true, title: { display: true, text: displayName(groupCol) } } },
+              },
+            },
+          });
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- text features
+  if (methodAllowed(executableMethods, "text_feature_analysis")) {
+    const textCol = detectTextColumns(ds)[0];
+    if (textCol) {
+      const texts = ds.data.map(row => row[textCol]).filter(v => typeof v === "string") as string[];
+      const terms = topTerms(texts, 15);
+      if (terms.length >= 5) {
+        push({
+          name: "text_top_terms",
+          description: `Most frequent terms in ${textCol}`,
+          caption: `Fifteen most frequent terms in ${displayName(textCol)} across ${formatCount(texts.length)} documents (lower-cased tokens of three or more letters; common stop words removed).`,
+          section: "descriptive",
+          height: 560,
+          config: {
+            type: "bar",
+            data: { labels: terms.map(([term]) => term), datasets: [{ label: "Frequency", data: terms.map(([, count]) => count), backgroundColor: FIGURE_COLORS.primary }] },
+            options: {
+              indexAxis: "y",
+              plugins: { title: { display: true, text: `Top terms in ${displayName(textCol)}` } },
+              scales: { x: { title: { display: true, text: "Frequency" } }, y: { title: { display: true, text: "Term" } } },
+            },
+          },
+        });
+      }
+    }
+  }
+
+  // Order figures as they would appear in a paper and keep the set focused.
+  const ordered = charts
+    .map((chart, index) => ({ chart, index }))
+    .sort((a, b) => SECTION_ORDER[a.chart.section || "main"] - SECTION_ORDER[b.chart.section || "main"] || a.index - b.index)
+    .map(item => item.chart);
+  if (ordered.length <= MAX_FIGURES) return ordered;
+  // Drop the lowest-priority diagnostics/descriptives first, keeping main results.
+  const dropOrder = ["composition_stacked_bar", "text_top_terms", "missing_data_profile", "synthetic_control_weights", "residual_fitted_plot", "category_distribution", "synthetic_control_gap", "box_plot"];
+  let result = ordered;
+  for (const name of dropOrder) {
+    if (result.length <= MAX_FIGURES) break;
+    result = result.filter(chart => chart.name !== name);
+  }
+  return result.slice(0, MAX_FIGURES);
 }
 
 function buildRoutingDiagnostics(
@@ -6982,422 +6749,450 @@ function buildRoutingDiagnostics(
   };
 }
 
-function generateDefaultTables(
+function tableNumber(value: number): number | string {
+  if (!Number.isFinite(value)) return "";
+  const abs = Math.abs(value);
+  if (abs >= 1e7) return Number(value.toPrecision(6));
+  if (abs >= 1000) return Math.round(value * 10) / 10;
+  if (abs >= 1) return Math.round(value * 1000) / 1000;
+  return Math.round(value * 10000) / 10000;
+}
+
+function formatCoefficient(value: number): string {
+  if (!Number.isFinite(value)) return "";
+  const abs = Math.abs(value);
+  if (abs === 0) return "0.000";
+  if (abs >= 1e5 || abs < 0.0005) return value.toExponential(2);
+  if (abs >= 100) return value.toFixed(1);
+  return value.toFixed(3);
+}
+
+interface RegressionModelColumn {
+  title: string;
+  coefficients: Map<string, { coef: number; se: number; p: number }>;
+  n: number;
+  r2: number;
+  r2Label: string;
+  adjR2?: number;
+  fixedEffects: string;
+  seType: string;
+}
+
+function coefficientMapFromEstimates(estimates: RegressionCoefficientEstimate[]): Map<string, { coef: number; se: number; p: number }> {
+  const map = new Map<string, { coef: number; se: number; p: number }>();
+  for (const estimate of estimates) {
+    map.set(estimate.name, { coef: estimate.coefficient, se: estimate.se, p: estimate.pValue });
+  }
+  return map;
+}
+
+/** Power-of-ten scale that brings very small coefficients on large-unit variables into a readable range. */
+function coefficientDisplayScale(ds: ParsedDataset, column: string, coefficients: Array<number | undefined>): number {
+  const finite = coefficients.filter((c): c is number => c !== undefined && Number.isFinite(c) && c !== 0);
+  if (finite.length === 0) return 1;
+  const largest = Math.max(...finite.map(c => Math.abs(c)));
+  if (largest >= 0.01) return 1;
+  const sd = columnStandardDeviation(ds, column);
+  if (!(sd >= 100)) return 1;
+  const scale = Math.pow(10, Math.floor(Math.log10(sd)));
+  return scale > 1 ? scale : 1;
+}
+
+function describeSeType(vcovType: "hc1" | "cluster", clusterCol?: string, clusterCount?: number): string {
+  if (vcovType === "cluster") return `Clustered by ${displayName(clusterCol || "entity", 20)}${clusterCount ? ` (${clusterCount})` : ""}`;
+  return "Robust (HC1)";
+}
+
+export function generateDefaultTables(
   allData: { name: string; data: Record<string, any>[]; columns: string[]; totalRows: number; fullDataProfile?: FullDataProfile }[],
   executableMethods: Set<string> | null,
   analysisTopic = "",
   analysisInputs?: AnalysisInputs,
   analysisBundle?: AnalysisComputationBundle | null,
-): { name: string; description: string; headers: string[]; rows: (string | number)[][] }[] {
-  const tables: { name: string; description: string; headers: string[]; rows: (string | number)[][] }[] = [];
+): TableDefinition[] {
+  const tables: TableDefinition[] = [];
   const bundle = resolveAnalysisComputationBundle(allData, analysisTopic, analysisInputs, executableMethods, analysisBundle);
   const ds = bundle?.ds || getPrimaryDataset(allData);
-  if (!ds || ds.data.length === 0) return tables;
+  if (!ds || ds.data.length === 0 || !bundle) return tables;
 
-  const numericCols = bundle?.meaningfulNumericCols || [];
-  const categoricalCols = bundle?.categoricalCols || [];
-  const primaryDescriptiveCol = bundle?.primaryDescriptiveCol;
-  const methodAssessments = bundle?.methodAssessments || [];
-  const designHints = bundle?.designHints || null;
-  const robustOls = bundle?.robustOls || null;
-  const panelFixedEffects = bundle?.panelFixedEffects || null;
-  const diffInDiff = bundle?.diffInDiff || null;
-  const syntheticControl = bundle?.syntheticControl || null;
-  const iv2Sls = bundle?.iv2Sls || null;
-  const rdd = bundle?.rdd || null;
-  const propensityScore = bundle?.propensityScore || null;
-  const quantileRegression = bundle?.quantileRegression || null;
+  const numericCols = bundle.meaningfulNumericCols || [];
+  const outcomeCol = bundle.primaryDescriptiveCol;
+  const designHints = bundle.designHints;
+  const groupCol = chooseGroupingColumn(ds, bundle, [], analysisTopic);
+  const { robustOls, panelFixedEffects, diffInDiff, syntheticControl, iv2Sls, rdd, propensityScore, quantileRegression } = bundle;
 
-  // Table 1: Descriptive statistics of numeric variables
+  // ---------------------------------------------------------------- variable roles (methods)
+  {
+    const causalOutputs = [
+      panelFixedEffects ? "two-way fixed effects" : "",
+      diffInDiff ? "difference-in-differences / event study" : "",
+      syntheticControl ? "synthetic control" : "",
+      iv2Sls ? "IV / 2SLS" : "",
+      rdd ? "regression discontinuity" : "",
+      propensityScore ? "inverse-probability weighting" : "",
+    ].filter(Boolean).join(", ") || "None (estimates are associational)";
+    tables.push({
+      name: "analysis_design_diagnostics",
+      description: "Variable roles and identification designs used in the empirical analysis",
+      section: "methods",
+      headers: ["Role", "Variable", "Notes"],
+      rows: [
+        ["Outcome", designHints.primaryOutcomeCol || "Not identified", "Dependent variable in all models"],
+        ["Key explanatory variable", designHints.primaryTreatmentCol || designHints.primaryRegressorCol || "Not identified", designHints.primaryTreatmentCol ? "Treatment / exposure indicator" : "Primary regressor"],
+        ["Controls", designHints.controlCols.length > 0 ? designHints.controlCols.join(", ") : "None", [
+          designHints.controlsAutoSelected ? "Selected automatically (plausible covariates; no controls were specified)" : "As specified",
+          "categorical controls enter as indicators against the most frequent level",
+          robustOls?.omittedControlCols.length ? `omitted (unusable or collinear): ${robustOls.omittedControlCols.join(", ")}` : "",
+        ].filter(Boolean).join("; ")],
+        ["Unit / cluster identifier", designHints.primaryEntityCol || "None", designHints.primaryEntityCol ? "Repeated units; used for clustered standard errors and fixed effects" : "No repeated unit identifier detected"],
+        ["Time variable", designHints.primaryTimeCol || "None", "Used for trends and time fixed effects"],
+        ["Grouping variable", groupCol || "None", "Used for subgroup comparisons"],
+        ["Missing-data handling", bundle.missingDataMode === "mean_imputation" ? "Mean imputation (predictors)" : "Complete-case", "Applied to regression samples"],
+        ["Feasible causal designs", causalOutputs, "Designs whose data requirements were met"],
+        ...(designHints.specifiedInputMissing.length > 0
+          ? [["Requested but unavailable", designHints.specifiedInputMissing.join("; "), "Not found in the data; not substituted"]]
+          : []),
+      ],
+    });
+  }
+
+  // ---------------------------------------------------------------- descriptive statistics
   if (numericCols.length > 0 && methodAllowed(executableMethods, "descriptive_statistics")) {
-    const headers = ["Variable", "N", "Mean", "Std Dev", "Min", "Q1", "Median", "Q3", "Max", "Skewness", "Source"];
+    const headers = ["Variable", "N", "Mean", "SD", "Min", "P25", "Median", "P75", "Max"];
     const rows: (string | number)[][] = [];
-
-    for (const col of numericCols.slice(0, 20)) {
-      const values = ds.data.map(r => Number(r[col])).filter(v => !isNaN(v));
-      const fullSummary = ds.fullDataProfile?.numeric[col];
-      if (values.length === 0 && !fullSummary) continue;
-      const sorted = [...values].sort((a, b) => a - b);
-      const n = fullSummary?.n || values.length;
-      const mean = fullSummary ? streamingMean(fullSummary) : values.reduce((a, b) => a + b, 0) / Math.max(1, values.length);
-      const std = fullSummary ? streamingStdDev(fullSummary) : Math.sqrt(values.reduce((a, b) => a + (b - mean) ** 2, 0) / (values.length - 1 || 1));
-      const sampleN = sorted.length;
-      const median = sampleN > 0 ? (sampleN % 2 === 0 ? (sorted[sampleN / 2 - 1] + sorted[sampleN / 2]) / 2 : sorted[Math.floor(sampleN / 2)]) : mean;
-      const q1 = sampleN > 0 ? sorted[Math.floor(sampleN * 0.25)] : mean;
-      const q3 = sampleN > 0 ? sorted[Math.floor(sampleN * 0.75)] : mean;
-
-      // Skewness
-      let skewness = 0;
-      if (std > 0 && values.length > 2) {
-        const m3 = values.reduce((a, b) => a + ((b - mean) / std) ** 3, 0) / values.length;
-        skewness = m3;
-      }
-
-      const displayCol = col.length > 30 ? col.slice(0, 27) + "..." : col;
-
+    const binaryVars: string[] = [];
+    for (const col of numericCols.slice(0, 15)) {
+      const values = numericValuesOf(ds, col);
+      const summary = summariseValues(values);
+      const full = ds.fullDataProfile?.numeric[col];
+      if (!summary && !full) continue;
+      if (isBinaryLikeColumn(ds, col)) binaryVars.push(col);
+      const n = full?.n || summary?.n || 0;
+      const meanValue = full ? streamingMean(full) : summary!.mean;
+      const sdValue = full ? streamingStdDev(full) : summary!.sd;
       rows.push([
-        displayCol,
+        displayName(col, 40),
         n,
-        Math.round(mean * 1000) / 1000,
-        Math.round(std * 1000) / 1000,
-        Math.round((fullSummary?.min ?? sorted[0] ?? mean) * 1000) / 1000,
-        Math.round(q1 * 1000) / 1000,
-        Math.round(median * 1000) / 1000,
-        Math.round(q3 * 1000) / 1000,
-        Math.round((fullSummary?.max ?? sorted[sorted.length - 1] ?? mean) * 1000) / 1000,
-        Math.round(skewness * 1000) / 1000,
-        fullSummary ? `All scanned rows; quantiles from ${values.length.toLocaleString()} representative rows` : "Materialized rows",
+        tableNumber(meanValue),
+        tableNumber(sdValue),
+        tableNumber(full?.min ?? summary!.min),
+        summary ? tableNumber(summary.q1) : "",
+        summary ? tableNumber(summary.median) : "",
+        summary ? tableNumber(summary.q3) : "",
+        tableNumber(full?.max ?? summary!.max),
       ]);
     }
-
     if (rows.length > 0) {
+      const notes = [
+        "Statistics are computed over non-missing values of each variable.",
+        ds.fullDataProfile?.scannedRows
+          ? `N, mean, SD, minimum and maximum use all ${formatCount(ds.fullDataProfile.scannedRows)} rows; quartiles use the retained analysis sample of ${formatCount(ds.data.length)} rows.`
+          : "",
+        binaryVars.length > 0 ? `For binary (0/1) variables (${binaryVars.slice(0, 6).map(v => displayName(v, 24)).join(", ")}) the mean is the proportion of ones.` : "",
+      ].filter(Boolean).join(" ");
       tables.push({
         name: "descriptive_statistics",
-        description: ds.fullDataProfile?.scannedRows
-          ? `Descriptive statistics using all ${ds.fullDataProfile.scannedRows.toLocaleString()} scanned rows for N/mean/std/min/max; quantiles use the bounded representative sample.`
-          : "Descriptive statistics of numeric variables",
+        description: `Summary statistics for the main numeric variables (N = ${formatCount(ds.totalRows)} observations)`,
+        section: "descriptive",
         headers,
         rows,
+        notes,
       });
     }
   }
 
-  // Table 2: Cross-tabulation / frequency table of categorical columns
-  if (categoricalCols.length > 0 && methodAllowed(executableMethods, "group_comparison")) {
-    const catCol = categoricalCols[0];
-    const counts: Record<string, number> = ds.fullDataProfile?.categorical[catCol]
-      ? { ...ds.fullDataProfile.categorical[catCol] }
-      : {};
-    if (Object.keys(counts).length === 0) {
-      for (const row of ds.data) {
-        const key = String(row[catCol] ?? "N/A").slice(0, 50);
-        counts[key] = (counts[key] || 0) + 1;
-      }
-    }
-    const sortedKeys = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 30);
-    const total = ds.fullDataProfile?.scannedRows || ds.data.length;
-
-    const displayCatCol = catCol.length > 30 ? catCol.slice(0, 27) + "..." : catCol;
-
-    tables.push({
-      name: "frequency_table",
-      description: ds.fullDataProfile?.scannedRows
-        ? `Frequency distribution of ${displayCatCol} using all ${ds.fullDataProfile.scannedRows.toLocaleString()} scanned rows`
-        : `Frequency distribution of ${displayCatCol}`,
-      headers: [displayCatCol, "Count", "Percentage", "Cumulative %"],
-      rows: (() => {
-        let cumPct = 0;
-        return sortedKeys.map(([key, count]) => {
-          const pct = (count / total) * 100;
-          cumPct += pct;
-          return [
-            key,
-            count,
-            `${pct.toFixed(1)}%`,
-            `${cumPct.toFixed(1)}%`,
-          ];
-        });
-      })(),
-    });
-  }
-
-  // Table 3: Correlation matrix (if enough numeric columns)
-  if (numericCols.length >= 2 && methodAllowed(executableMethods, "correlation")) {
-    const cols = numericCols.slice(0, 10);
-    const displayCols = cols.map(c => c.length > 15 ? c.slice(0, 12) + "..." : c);
-    const headers = ["Variable", ...displayCols];
-    const rows: (string | number)[][] = [];
-
-    for (let i = 0; i < cols.length; i++) {
-      const row: (string | number)[] = [displayCols[i]];
-      for (let j = 0; j < cols.length; j++) {
-        const v1 = ds.data.map(r => Number(r[cols[i]])).filter(v => !isNaN(v));
-        const v2 = ds.data.map(r => Number(r[cols[j]])).filter(v => !isNaN(v));
-        const n = Math.min(v1.length, v2.length);
-        if (n < 3) { row.push(0); continue; }
-        const m1 = v1.slice(0, n).reduce((a, b) => a + b, 0) / n;
-        const m2 = v2.slice(0, n).reduce((a, b) => a + b, 0) / n;
-        let num = 0, d1 = 0, d2 = 0;
-        for (let k = 0; k < n; k++) {
-          num += (v1[k] - m1) * (v2[k] - m2);
-          d1 += (v1[k] - m1) ** 2;
-          d2 += (v2[k] - m2) ** 2;
-        }
-        const corr = d1 > 0 && d2 > 0 ? num / Math.sqrt(d1 * d2) : 0;
-        row.push(Math.round(corr * 1000) / 1000);
-      }
-      rows.push(row);
-    }
-
-    tables.push({
-      name: "correlation_matrix",
-      description: "Pearson correlation matrix of numeric variables",
-      headers,
-      rows,
-    });
-  }
-
-  // Table 4: Regression results (if linear_regression is executable)
-  if (numericCols.length >= 2 && methodAllowed(executableMethods, "linear_regression")) {
-    const regressionHeaders = ["Dep. Var", "Indep. Var", "Coeff (beta)", "Std. Error", "t-stat", "p-value", "R²", "Adj. R²", "N"];
-    const regressionRows: (string | number)[][] = [];
-
-    const pairsEvaluated: { xCol: string; yCol: string; reg: { slope: number; intercept: number; r2: number; n: number }; se: number; tStat: number; pValue: number }[] = [];
-
-    for (let i = 0; i < Math.min(numericCols.length, 6); i++) {
-      for (let j = i + 1; j < Math.min(numericCols.length, 6); j++) {
-        const xCol = numericCols[i];
-        const yCol = numericCols[j];
-        const pairs = parseNumericPairs(ds, xCol, yCol);
-        const reg = regressionStatsFromPairs(pairs);
-        if (!reg || reg.n < 10) continue;
-
-        // Compute standard error, t-statistic, p-value
-        let ssRes = 0;
-        let ssX = 0;
-        const meanX = pairs.reduce((a, p) => a + p[0], 0) / reg.n;
-        for (const [x, y] of pairs) {
-          const pred = reg.intercept + reg.slope * x;
-          ssRes += (y - pred) ** 2;
-          ssX += (x - meanX) ** 2;
-        }
-        const mse = ssRes / (reg.n - 2);
-        const se = ssX > 0 ? Math.sqrt(mse / ssX) : 0;
-        const tStat = se > 0 ? reg.slope / se : 0;
-        const pValue = approximateCorrelationPValue(Math.sqrt(reg.r2) * Math.sign(reg.slope), reg.n);
-
-        pairsEvaluated.push({ xCol, yCol, reg, se, tStat, pValue });
-      }
-    }
-
-    // Sort by R² descending, take top 5
-    pairsEvaluated.sort((a, b) => b.reg.r2 - a.reg.r2);
-    for (const pe of pairsEvaluated.slice(0, 5)) {
-      const displayX = pe.xCol.length > 15 ? pe.xCol.slice(0, 12) + "..." : pe.xCol;
-      const displayY = pe.yCol.length > 15 ? pe.yCol.slice(0, 12) + "..." : pe.yCol;
-      const adjR2 = 1 - (1 - pe.reg.r2) * (pe.reg.n - 1) / (pe.reg.n - 2);
-      const pStr = pe.pValue < 0.001 ? "<0.001" : pe.pValue.toFixed(4);
-
-      regressionRows.push([
-        displayY,
-        displayX,
-        Math.round(pe.reg.slope * 10000) / 10000,
-        Math.round(pe.se * 10000) / 10000,
-        Math.round(pe.tStat * 1000) / 1000,
-        pStr,
-        Math.round(pe.reg.r2 * 1000) / 1000,
-        Math.round(adjR2 * 1000) / 1000,
-        pe.reg.n,
-      ]);
-    }
-
-    if (regressionRows.length > 0) {
+  // ---------------------------------------------------------------- frequency table
+  if (groupCol && (methodAllowed(executableMethods, "descriptive_statistics") || methodAllowed(executableMethods, "group_comparison"))) {
+    const entries = Array.from(categoryCounts(ds, groupCol).entries()).sort((a, b) => b[1] - a[1]);
+    if (entries.length >= 2) {
+      const total = entries.reduce((sum, [, c]) => sum + c, 0);
+      const top = entries.slice(0, 15);
+      const rest = entries.slice(15).reduce((sum, [, c]) => sum + c, 0);
+      if (rest > 0) top.push([`Other (${entries.length - 15} categories)`, rest]);
+      let cumulative = 0;
       tables.push({
-        name: "regression_results",
-        description: "OLS regression results (top models by R²)",
-        headers: regressionHeaders,
-        rows: regressionRows,
+        name: "frequency_table",
+        description: `Frequency distribution of ${displayName(groupCol)}`,
+        section: "descriptive",
+        headers: [displayName(groupCol, 30), "N", "Percent", "Cumulative percent"],
+        rows: top.map(([key, count]) => {
+          const pct = (count / total) * 100;
+          cumulative += pct;
+          return [key, count, `${pct.toFixed(1)}%`, `${Math.min(100, cumulative).toFixed(1)}%`];
+        }),
+        notes: `Total N = ${formatCount(total)} non-missing observations.`,
       });
     }
   }
 
-  // Table 5: Group comparison with significance (if group_comparison is executable)
-  if (categoricalCols.length > 0 && primaryDescriptiveCol && methodAllowed(executableMethods, "group_comparison")) {
-    const catCol = categoricalCols[0];
-    const numCol = primaryDescriptiveCol;
-
-    const groups: Record<string, number[]> = {};
-    for (const row of ds.data) {
-      const key = String(row[catCol] ?? "").trim();
-      const val = Number(row[numCol]);
-      if (!key || isNaN(val)) continue;
-      if (!groups[key]) groups[key] = [];
-      groups[key].push(val);
+  // ---------------------------------------------------------------- correlation matrix
+  if (numericCols.length >= 2 && methodAllowed(executableMethods, "correlation")) {
+    const cols = numericCols.filter(c => !isPathologicalNumericColumn(ds, c)).slice(0, 7);
+    if (cols.length >= 2) {
+      let minN = Infinity;
+      let maxN = 0;
+      const rows = cols.map((rowCol, i) => {
+        const row: (string | number)[] = [`(${i + 1}) ${displayName(rowCol, 30)}`];
+        for (let j = 0; j < cols.length; j++) {
+          if (j > i) { row.push(""); continue; }
+          if (j === i) { row.push("1"); continue; }
+          const result = pearsonFromPairs(parseNumericPairs(ds, rowCol, cols[j]));
+          if (!result) { row.push("NA"); continue; }
+          minN = Math.min(minN, result.n);
+          maxN = Math.max(maxN, result.n);
+          row.push(`${result.r.toFixed(2)}${significanceStars(result.p)}`);
+        }
+        return row;
+      });
+      tables.push({
+        name: "correlation_matrix",
+        description: "Pairwise Pearson correlation coefficients",
+        section: "descriptive",
+        headers: ["Variable", ...cols.map((_, i) => `(${i + 1})`)],
+        rows,
+        notes: `Pearson correlations on pairwise-complete observations${Number.isFinite(minN) ? ` (n = ${formatCount(minN)}${maxN !== minN ? ` to ${formatCount(maxN)}` : ""})` : ""}. * p < 0.05, ** p < 0.01, *** p < 0.001 (two-sided t test).`,
+      });
     }
+  }
 
-    const validGroupEntries = Object.entries(groups).filter(([, v]) => v.length >= 3).sort((a, b) => b[1].length - a[1].length).slice(0, 15);
-
-    if (validGroupEntries.length >= 2) {
-      const displayCatCol = catCol.length > 20 ? catCol.slice(0, 17) + "..." : catCol;
-      const displayNumCol = numCol.length > 20 ? numCol.slice(0, 17) + "..." : numCol;
-
-      const compHeaders = [displayCatCol, "N", `Mean ${displayNumCol}`, "Std Dev", "Min", "Max"];
-      const compRows: (string | number)[][] = [];
-
-      // Compute grand stats
-      const allVals = validGroupEntries.flatMap(([, v]) => v);
-      const grandMean = allVals.reduce((a, b) => a + b, 0) / allVals.length;
-
-      for (const [key, vals] of validGroupEntries) {
-        const n = vals.length;
-        const mean = vals.reduce((a, b) => a + b, 0) / n;
-        const std = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1 || 1));
-        const sorted = [...vals].sort((a, b) => a - b);
-        const displayKey = key.length > 20 ? key.slice(0, 17) + "..." : key;
-
-        compRows.push([
-          displayKey,
-          n,
-          Math.round(mean * 1000) / 1000,
-          Math.round(std * 1000) / 1000,
-          Math.round(sorted[0] * 1000) / 1000,
-          Math.round(sorted[n - 1] * 1000) / 1000,
-        ]);
-      }
-
-      // Add ANOVA F-test summary row
-      let ssBetween = 0;
-      let ssWithin = 0;
-      const totalN = allVals.length;
-      const k = validGroupEntries.length;
-      for (const [, vals] of validGroupEntries) {
-        const groupMean = vals.reduce((a, b) => a + b, 0) / vals.length;
-        ssBetween += vals.length * (groupMean - grandMean) ** 2;
-        for (const v of vals) ssWithin += (v - groupMean) ** 2;
-      }
-      const dfBetween = k - 1;
-      const dfWithin = totalN - k;
-      const fStat = dfWithin > 0 && dfBetween > 0 ? (ssBetween / dfBetween) / (ssWithin / dfWithin) : 0;
-      const eta2 = ssBetween / (ssBetween + ssWithin);
-
-      // Approximate F-test p-value
-      const fPValue = fStat > 6.63 ? "<0.001" : fStat > 3.84 ? "<0.05" : fStat > 2.71 ? "<0.10" : ">0.10";
-
-      compRows.push([
-        `F(${dfBetween},${dfWithin})=${Math.round(fStat * 100) / 100}, p${fPValue}, eta²=${Math.round(eta2 * 1000) / 1000}`,
-        totalN, "", "", "", "",
-      ]);
-
+  // ---------------------------------------------------------------- group comparison
+  if (outcomeCol && groupCol && groupCol !== outcomeCol && methodAllowed(executableMethods, "group_comparison")) {
+    const grouped = groupNumericValues(ds, groupCol, outcomeCol);
+    const kept = Array.from(grouped.entries()).filter(([, v]) => v.length >= 2).sort((a, b) => b[1].length - a[1].length).slice(0, 15);
+    const keys = orderCategoryKeys(kept.map(([k]) => k), k => grouped.get(k)?.length || 0);
+    if (keys.length >= 2) {
+      const rows = keys.map(key => {
+        const ci = meanConfidenceInterval(grouped.get(key)!)!;
+        return [key, ci.n, tableNumber(ci.mean), tableNumber(ci.sd), `[${formatCoefficient(ci.low)}, ${formatCoefficient(ci.high)}]`];
+      });
+      const anova = oneWayAnova(keys.map(k => grouped.get(k)!));
+      const welch = keys.length === 2 ? welchTTest(grouped.get(keys[0])!, grouped.get(keys[1])!) : null;
+      const notes = [
+        "95% confidence intervals for group means are based on the t distribution.",
+        anova ? `One-way ANOVA: F(${anova.df1}, ${anova.df2}) = ${anova.f.toFixed(3)}, p ${formatPValue(anova.p).startsWith("<") ? formatPValue(anova.p) : `= ${formatPValue(anova.p)}`}, eta squared = ${anova.eta2.toFixed(3)}.` : "",
+        welch ? `Welch two-sample t test (${keys[0]} minus ${keys[1]}): difference = ${formatCoefficient(welch.diff)}, t(${welch.df.toFixed(1)}) = ${welch.t.toFixed(3)}, p ${formatPValue(welch.p).startsWith("<") ? formatPValue(welch.p) : `= ${formatPValue(welch.p)}`}.` : "",
+      ].filter(Boolean).join(" ");
       tables.push({
         name: "group_comparison",
-        description: `Group comparison: ${displayNumCol} by ${displayCatCol} (ANOVA)`,
-        headers: compHeaders,
-        rows: compRows,
+        description: `${displayName(outcomeCol)} by ${displayName(groupCol)}: group means, dispersion and tests of equality`,
+        section: "main",
+        headers: [displayName(groupCol, 28), "N", "Mean", "SD", "95% CI"],
+        rows,
+        notes,
       });
     }
   }
 
-  // Table 6: Missing data summary
-  {
-    const headers = ["Variable", "N Total", "N Missing", "Missing %", "N Valid", "Data Type"];
-    const rows: (string | number)[][] = [];
-
-    for (const col of ds.columns.slice(0, 30)) {
-      let missing = 0;
-      let numericCount = 0;
-      let totalNonNull = 0;
-
-      for (const row of ds.data) {
-        const val = row[col];
-        if (isMissingValue(val)) {
-          missing++;
-        } else {
-          totalNonNull++;
-          if (typeof val === "number" || (typeof val === "string" && !isNaN(Number(val)) && val.trim() !== "")) {
-            numericCount++;
-          }
+  // ---------------------------------------------------------------- regression models
+  const models: RegressionModelColumn[] = [];
+  let regressionSampleNote = "";
+  if (robustOls && methodAllowed(executableMethods, "robust_ols")) {
+    const prepared = bundle.preparedRegression;
+    if (prepared && robustOls.controlCols.length > 0) {
+      const primaryIndex = prepared.regressorCols.indexOf(prepared.primaryRegressorCol);
+      if (primaryIndex >= 0) {
+        const bivariate = fitLinearModel(prepared.rows.map(row => ({ y: row.y, x: [row.x[primaryIndex]], clusterId: row.clusterId })));
+        if (bivariate) {
+          const names = ["intercept", prepared.primaryRegressorCol];
+          models.push({
+            title: "(1) OLS",
+            coefficients: new Map(names.map((name, i) => [name, { coef: bivariate.coefficients[i], se: bivariate.standardErrors[i], p: bivariate.pValues[i] }])),
+            n: bivariate.n,
+            r2: bivariate.r2,
+            r2Label: "R-squared",
+            adjR2: bivariate.adjR2,
+            fixedEffects: "No",
+            seType: describeSeType(bivariate.vcovType, prepared.clusterCol, bivariate.clusterCount),
+          });
         }
       }
-
-      const dataType = totalNonNull > 0 && numericCount / totalNonNull > 0.7 ? "Numeric" : "Categorical";
-      const displayCol = col.length > 30 ? col.slice(0, 27) + "..." : col;
-
-      rows.push([
-        displayCol,
-        ds.data.length,
-        missing,
-        `${((missing / ds.data.length) * 100).toFixed(1)}%`,
-        ds.data.length - missing,
-        dataType,
-      ]);
     }
-
-    tables.push({
-      name: "missing_data_summary",
-      description: "Missing data summary by variable",
-      headers,
-      rows,
+    models.push({
+      title: `(${models.length + 1}) OLS${robustOls.controlCols.length ? " + controls" : ""}`,
+      coefficients: coefficientMapFromEstimates(robustOls.coefficients),
+      n: robustOls.n,
+      r2: robustOls.r2,
+      r2Label: "R-squared",
+      adjR2: robustOls.adjR2,
+      fixedEffects: "No",
+      seType: describeSeType(robustOls.vcovType, robustOls.clusterCol, robustOls.clusterCount),
     });
+    if (models.length === 2 && models[0].n === models[1].n) regressionSampleNote = `Columns (1) and (2) use the same estimation sample.`;
   }
-
-  // Table 7: Methodology applicability matrix
-  if (methodAssessments.length > 0) {
-    tables.push({
-      name: "method_applicability_matrix",
-      description: "Applicability matrix for major statistical methodologies on the current dataset",
-      headers: ["Methodology", "Status", "Readiness (0-100)", "Evidence", "Interpretation"],
-      rows: methodAssessments.map(item => ([
-        item.label,
-        formatMethodApplicabilityStatus(item.status),
-        item.readinessScore,
-        item.evidence,
-        item.notes,
-      ])),
-    });
-  }
-
-  if (robustOls && methodAllowed(executableMethods, "robust_ols")) {
-    tables.push({
-      name: "robust_ols_results",
-      description: `Associational multivariate OLS for outcome ${robustOls.yCol} on regressor ${robustOls.xCol}${robustOls.controlCols.length > 0 ? ` with controls ${robustOls.controlCols.join(", ")}` : ""}; interpret causally only with a credible identification design.`,
-      headers: ["Outcome", "Primary regressor", "Controls", "Coeff", "SE", "SE type", "Clusters", "p-value", "95% CI", "R2", "Adj R2", "N", "Missing-data"],
-      rows: [[
-        robustOls.yCol.length > 18 ? `${robustOls.yCol.slice(0, 15)}...` : robustOls.yCol,
-        robustOls.xCol.length > 18 ? `${robustOls.xCol.slice(0, 15)}...` : robustOls.xCol,
-        robustOls.controlCols.join(", ") || "none",
-        Math.round(robustOls.slope * 10000) / 10000,
-        Math.round(robustOls.seSlope * 10000) / 10000,
-        robustOls.vcovType,
-        robustOls.clusterCount || 0,
-        robustOls.pValue < 0.001 ? "<0.001" : robustOls.pValue.toFixed(4),
-        `[${(Math.round(robustOls.ciLower * 1000) / 1000).toFixed(3)}, ${(Math.round(robustOls.ciUpper * 1000) / 1000).toFixed(3)}]`,
-        Math.round(robustOls.r2 * 1000) / 1000,
-        Math.round(robustOls.adjR2 * 1000) / 1000,
-        robustOls.n,
-        robustOls.missingDataMode,
-      ]],
-    });
-  }
-
   if (panelFixedEffects && methodAllowed(executableMethods, "panel_fixed_effects")) {
-    tables.push({
-      name: "panel_fixed_effects_results",
-      description: `Two-way fixed-effects regression for ${panelFixedEffects.yCol} on ${panelFixedEffects.xCol}${panelFixedEffects.controlCols.length > 0 ? ` with controls ${panelFixedEffects.controlCols.join(", ")}` : ""}`,
-      headers: ["Outcome", "Primary regressor", "Controls", "Beta", "SE", "SE type", "Clusters", "p-value", "Within R2", "Entities", "Periods", "N", "Missing-data"],
-      rows: [[
-        panelFixedEffects.yCol.length > 18 ? `${panelFixedEffects.yCol.slice(0, 15)}...` : panelFixedEffects.yCol,
-        panelFixedEffects.xCol.length > 18 ? `${panelFixedEffects.xCol.slice(0, 15)}...` : panelFixedEffects.xCol,
-        panelFixedEffects.controlCols.join(", ") || "none",
-        Math.round(panelFixedEffects.beta * 10000) / 10000,
-        Math.round(panelFixedEffects.se * 10000) / 10000,
-        panelFixedEffects.vcovType,
-        panelFixedEffects.clusterCount || 0,
-        panelFixedEffects.pValue < 0.001 ? "<0.001" : panelFixedEffects.pValue.toFixed(4),
-        Math.round(panelFixedEffects.r2Within * 1000) / 1000,
-        panelFixedEffects.entities,
-        panelFixedEffects.periods,
-        panelFixedEffects.n,
-        panelFixedEffects.missingDataMode,
-      ]],
+    models.push({
+      title: `(${models.length + 1}) Two-way FE`,
+      // The constant is not identified after the within transformation.
+      coefficients: coefficientMapFromEstimates(panelFixedEffects.coefficients.filter(c => c.name !== "intercept")),
+      n: panelFixedEffects.n,
+      r2: panelFixedEffects.r2Within,
+      r2Label: "Within R-squared",
+      fixedEffects: `Unit + time (${panelFixedEffects.entities} units, ${panelFixedEffects.periods} periods)`,
+      seType: describeSeType(panelFixedEffects.vcovType, panelFixedEffects.clusterCol, panelFixedEffects.clusterCount),
     });
   }
+  if (models.length > 0) {
+    const primary = robustOls?.xCol || panelFixedEffects?.xCol || "";
+    const allNames = uniqueColumns(models.flatMap(model => Array.from(model.coefficients.keys())));
+    const ordered = [
+      ...allNames.filter(name => name === primary),
+      ...allNames.filter(name => name !== primary && name !== "intercept"),
+      ...allNames.filter(name => name === "intercept"),
+    ];
+    const rows: (string | number)[][] = [];
+    const rescaled: string[] = [];
+    for (const name of ordered) {
+      // Report coefficients on large-unit regressors per a round number of units so the
+      // table does not show values such as 0.0000098.
+      const scale = name === "intercept" ? 1 : coefficientDisplayScale(ds, name, models.map(model => model.coefficients.get(name)?.coef));
+      const label = name === "intercept" ? "Constant" : `${displayName(name, 34)}${scale > 1 ? ` (per ${formatCount(scale)})` : ""}`;
+      if (scale > 1) rescaled.push(`${name} per ${formatCount(scale)} units`);
+      rows.push([label, ...models.map(model => {
+        const c = model.coefficients.get(name);
+        return c ? `${formatCoefficient(c.coef * scale)}${significanceStars(c.p)}` : "";
+      })]);
+      rows.push(["", ...models.map(model => {
+        const c = model.coefficients.get(name);
+        return c ? `(${formatCoefficient(c.se * scale)})` : "";
+      })]);
+    }
+    rows.push(["Fixed effects", ...models.map(model => model.fixedEffects)]);
+    rows.push(["Standard errors", ...models.map(model => model.seType)]);
+    rows.push(["Observations", ...models.map(model => formatCount(model.n))]);
+    rows.push(["R-squared", ...models.map(model => `${model.r2.toFixed(3)}${model.r2Label === "Within R-squared" ? " (within)" : ""}`)]);
+    if (models.some(model => model.adjR2 !== undefined)) {
+      rows.push(["Adjusted R-squared", ...models.map(model => (model.adjR2 !== undefined ? model.adjR2.toFixed(3) : ""))]);
+    }
+    const outcome = robustOls?.yCol || panelFixedEffects?.yCol || "outcome";
+    tables.push({
+      name: "regression_results",
+      description: `Regression estimates for ${displayName(outcome)}`,
+      section: "main",
+      headers: ["", ...models.map(model => model.title)],
+      rows,
+      notes: [
+        `Dependent variable: ${outcome}. Coefficients with standard errors in parentheses. * p < 0.05, ** p < 0.01, *** p < 0.001.`,
+        regressionSampleNote,
+        rescaled.length ? `Coefficients rescaled for readability: ${rescaled.join("; ")}.` : "",
+        bundle.missingDataMode === "mean_imputation" && robustOls?.imputedPredictorCells ? `${formatCount(robustOls.imputedPredictorCells)} missing predictor values were mean-imputed.` : "",
+        !diffInDiff && !iv2Sls && !rdd && !propensityScore ? "Estimates are conditional associations and should not be interpreted causally without an identification strategy." : "",
+      ].filter(Boolean).join(" "),
+    });
+  } else if (outcomeCol && numericCols.length >= 2 && methodAllowed(executableMethods, "linear_regression")) {
+    const rows: (string | number)[][] = [];
+    for (const xCol of numericCols.filter(c => c !== outcomeCol).slice(0, 8)) {
+      const pairs = parseNumericPairs(ds, xCol, outcomeCol);
+      const reg = regressionStatsFromPairs(pairs);
+      if (!reg) continue;
+      const meanX = pairs.reduce((a, p) => a + p[0], 0) / reg.n;
+      let ssRes = 0;
+      let ssX = 0;
+      for (const [x, y] of pairs) {
+        ssRes += (y - (reg.intercept + reg.slope * x)) ** 2;
+        ssX += (x - meanX) ** 2;
+      }
+      const se = ssX > 0 && reg.n > 2 ? Math.sqrt(ssRes / (reg.n - 2) / ssX) : NaN;
+      const t = se > 0 ? reg.slope / se : NaN;
+      const p = studentTTwoTailPValue(t, reg.n - 2);
+      rows.push([displayName(xCol, 34), `${formatCoefficient(reg.slope)}${significanceStars(p)}`, formatCoefficient(se), Number.isFinite(t) ? t.toFixed(2) : "", formatPValue(p), reg.r2.toFixed(3), formatCount(reg.n)]);
+    }
+    if (rows.length > 0) {
+      tables.push({
+        name: "regression_results",
+        description: `Bivariate OLS regressions of ${displayName(outcomeCol)} on candidate explanatory variables`,
+        section: "main",
+        headers: ["Explanatory variable", "Coefficient", "SE", "t", "p-value", "R-squared", "N"],
+        rows,
+        notes: `Each row is a separate bivariate regression with ${outcomeCol} as the dependent variable (conventional OLS standard errors). * p < 0.05, ** p < 0.01, *** p < 0.001. Associations are unadjusted.`,
+      });
+    }
+  }
 
+  // ---------------------------------------------------------------- causal designs
   if (diffInDiff && methodAllowed(executableMethods, "diff_in_diff")) {
+    const onset = diffInDiff.series.find(point => point.relIndex === 0)?.label ?? formatNumber(diffInDiff.treatmentStart);
     tables.push({
       name: "difference_in_differences",
-      description: `Difference-in-differences summary for ${diffInDiff.outcomeCol}`,
-      headers: ["Outcome", "Treatment", "Pre T", "Post T", "Pre C", "Post C", "DiD", "Pre-trend delta", "N"],
-      rows: [[
-        diffInDiff.outcomeCol.length > 18 ? `${diffInDiff.outcomeCol.slice(0, 15)}...` : diffInDiff.outcomeCol,
-        diffInDiff.treatmentCol.length > 18 ? `${diffInDiff.treatmentCol.slice(0, 15)}...` : diffInDiff.treatmentCol,
-        Math.round(diffInDiff.treatedPre * 1000) / 1000,
-        Math.round(diffInDiff.treatedPost * 1000) / 1000,
-        Math.round(diffInDiff.controlPre * 1000) / 1000,
-        Math.round(diffInDiff.controlPost * 1000) / 1000,
-        Math.round(diffInDiff.estimate * 1000) / 1000,
-        Math.round(diffInDiff.preTrendDelta * 1000) / 1000,
-        diffInDiff.n,
-      ]],
+      description: `Difference-in-differences summary for ${displayName(diffInDiff.outcomeCol)}`,
+      section: "main",
+      headers: ["Quantity", "Value"],
+      rows: [
+        ["Outcome", diffInDiff.outcomeCol],
+        ["Treatment indicator", diffInDiff.treatmentCol],
+        ["First treated period", onset],
+        ["Treated group mean, pre-treatment", tableNumber(diffInDiff.treatedPre)],
+        ["Treated group mean, post-treatment", tableNumber(diffInDiff.treatedPost)],
+        ["Control group mean, pre-treatment", tableNumber(diffInDiff.controlPre)],
+        ["Control group mean, post-treatment", tableNumber(diffInDiff.controlPost)],
+        ["Difference-in-differences estimate", tableNumber(diffInDiff.estimate)],
+        ["Pre-treatment trend difference", tableNumber(diffInDiff.preTrendDelta)],
+        ["Observations", formatCount(diffInDiff.n)],
+      ],
+      notes: "Canonical 2 x 2 difference in group means: (treated post - treated pre) - (control post - control pre). A pre-treatment trend difference close to zero supports parallel trends.",
+    });
+  }
+
+  if (iv2Sls && methodAllowed(executableMethods, "iv_2sls")) {
+    tables.push({
+      name: "iv_2sls_results",
+      description: `Instrumental-variables (2SLS) estimates for ${displayName(iv2Sls.yCol)}`,
+      section: "main",
+      headers: ["Quantity", "Value"],
+      rows: [
+        ["Outcome", iv2Sls.yCol],
+        ["Endogenous regressor", iv2Sls.xCol],
+        ["Instrument", iv2Sls.zCol],
+        ["2SLS coefficient", `${formatCoefficient(iv2Sls.beta)}${significanceStars(iv2Sls.pValue)}`],
+        ["Standard error", formatCoefficient(iv2Sls.se)],
+        ["95% confidence interval", `[${formatCoefficient(iv2Sls.ciLower)}, ${formatCoefficient(iv2Sls.ciUpper)}]`],
+        ["p-value", formatPValue(iv2Sls.pValue)],
+        ["First-stage coefficient", formatCoefficient(iv2Sls.firstStageSlope)],
+        ["First-stage F statistic", iv2Sls.firstStageF.toFixed(2)],
+        ["Reduced-form coefficient", formatCoefficient(iv2Sls.reducedFormSlope)],
+        ["Observations", formatCount(iv2Sls.n)],
+      ],
+      notes: "Just-identified 2SLS. A first-stage F statistic below 10 indicates a weak instrument; the exclusion restriction cannot be tested with a single instrument. * p < 0.05, ** p < 0.01, *** p < 0.001.",
+    });
+  }
+
+  if (rdd && methodAllowed(executableMethods, "regression_discontinuity")) {
+    tables.push({
+      name: "regression_discontinuity_results",
+      description: `Regression-discontinuity estimate for ${displayName(rdd.outcomeCol)}`,
+      section: "main",
+      headers: ["Quantity", "Value"],
+      rows: [
+        ["Outcome", rdd.outcomeCol],
+        ["Running variable", rdd.runningCol],
+        ["Treatment variable", rdd.treatmentCol],
+        ["Cutoff", tableNumber(rdd.cutoff)],
+        ["Bandwidth", tableNumber(rdd.bandwidth)],
+        ["Discontinuity estimate", `${formatCoefficient(rdd.estimate)}${significanceStars(rdd.pValue)}`],
+        ["Standard error", formatCoefficient(rdd.se)],
+        ["p-value", formatPValue(rdd.pValue)],
+        ["Observations within bandwidth", formatCount(rdd.nLocal)],
+        ["Observations left / right of cutoff", `${formatCount(rdd.leftN)} / ${formatCount(rdd.rightN)}`],
+      ],
+      notes: "Local-linear regression with separate slopes on each side of the cutoff. * p < 0.05, ** p < 0.01, *** p < 0.001.",
+    });
+  }
+
+  if (propensityScore && methodAllowed(executableMethods, "propensity_score")) {
+    tables.push({
+      name: "propensity_score_balance",
+      description: `Covariate balance before and after inverse-probability weighting (${displayName(propensityScore.treatmentCol)})`,
+      section: "diagnostic",
+      headers: ["Covariate", "Mean (treated)", "Mean (control)", "Weighted mean (treated)", "Weighted mean (control)", "SMD before", "SMD after"],
+      rows: propensityScore.balance.map(item => ([
+        displayName(item.covariate, 30),
+        tableNumber(item.meanTreated),
+        tableNumber(item.meanControl),
+        tableNumber(item.weightedTreated),
+        tableNumber(item.weightedControl),
+        tableNumber(item.smdBefore),
+        tableNumber(item.smdAfter),
+      ])),
+      notes: `SMD = standardised mean difference; |SMD| < 0.1 indicates adequate balance. IPW estimate of the average treatment effect on ${propensityScore.outcomeCol}: ${formatCoefficient(propensityScore.ate)} (SE ${formatCoefficient(propensityScore.se)}; 95% CI [${formatCoefficient(propensityScore.ciLower)}, ${formatCoefficient(propensityScore.ciUpper)}]; p ${formatPValue(propensityScore.pValue).startsWith("<") ? formatPValue(propensityScore.pValue) : `= ${formatPValue(propensityScore.pValue)}`}; n = ${formatCount(propensityScore.n)}).`,
     });
   }
 
@@ -7405,119 +7200,79 @@ function generateDefaultTables(
     tables.push({
       name: "synthetic_control_weights",
       description: `Synthetic-control donor weights for ${syntheticControl.treatedUnit}`,
-      headers: ["Treated Unit", "Donor Unit", "Weight", "Pre RMSE", "Post RMSE", "Mean Gap Post"],
-      rows: syntheticControl.weights.slice(0, 10).map(item => ([
-        syntheticControl.treatedUnit.length > 18 ? `${syntheticControl.treatedUnit.slice(0, 15)}...` : syntheticControl.treatedUnit,
-        item.unit.length > 18 ? `${item.unit.slice(0, 15)}...` : item.unit,
-        Math.round(item.weight * 1000) / 1000,
-        Math.round(syntheticControl.preRmse * 1000) / 1000,
-        Math.round(syntheticControl.postRmse * 1000) / 1000,
-        Math.round(syntheticControl.attPostMean * 1000) / 1000,
-      ])),
-    });
-  }
-
-  if (iv2Sls && methodAllowed(executableMethods, "iv_2sls")) {
-    tables.push({
-      name: "iv_2sls_results",
-      description: `Baseline just-identified 2SLS results for ${iv2Sls.yCol} on ${iv2Sls.xCol} using ${iv2Sls.zCol}`,
-      headers: ["Outcome", "Endogenous Var", "Instrument", "2SLS Beta", "SE", "t-stat", "p-value", "95% CI", "1st-stage F", "N"],
-      rows: [[
-        iv2Sls.yCol.length > 18 ? `${iv2Sls.yCol.slice(0, 15)}...` : iv2Sls.yCol,
-        iv2Sls.xCol.length > 18 ? `${iv2Sls.xCol.slice(0, 15)}...` : iv2Sls.xCol,
-        iv2Sls.zCol.length > 18 ? `${iv2Sls.zCol.slice(0, 15)}...` : iv2Sls.zCol,
-        Math.round(iv2Sls.beta * 10000) / 10000,
-        Math.round(iv2Sls.se * 10000) / 10000,
-        Math.round(iv2Sls.tStat * 1000) / 1000,
-        iv2Sls.pValue < 0.001 ? "<0.001" : iv2Sls.pValue.toFixed(4),
-        `[${(Math.round(iv2Sls.ciLower * 1000) / 1000).toFixed(3)}, ${(Math.round(iv2Sls.ciUpper * 1000) / 1000).toFixed(3)}]`,
-        Math.round(iv2Sls.firstStageF * 1000) / 1000,
-        iv2Sls.n,
-      ]],
-    });
-  }
-
-  if (rdd && methodAllowed(executableMethods, "regression_discontinuity")) {
-    tables.push({
-      name: "regression_discontinuity_results",
-      description: `Local-linear regression discontinuity summary for ${rdd.outcomeCol}`,
-      headers: ["Outcome", "Running Var", "Treatment Var", "Cutoff", "Bandwidth", "Jump", "SE", "p-value", "N local", "Left/Right N"],
-      rows: [[
-        rdd.outcomeCol.length > 18 ? `${rdd.outcomeCol.slice(0, 15)}...` : rdd.outcomeCol,
-        rdd.runningCol.length > 18 ? `${rdd.runningCol.slice(0, 15)}...` : rdd.runningCol,
-        rdd.treatmentCol.length > 18 ? `${rdd.treatmentCol.slice(0, 15)}...` : rdd.treatmentCol,
-        Math.round(rdd.cutoff * 1000) / 1000,
-        Math.round(rdd.bandwidth * 1000) / 1000,
-        Math.round(rdd.estimate * 1000) / 1000,
-        Math.round(rdd.se * 1000) / 1000,
-        rdd.pValue < 0.001 ? "<0.001" : rdd.pValue.toFixed(4),
-        rdd.nLocal,
-        `${rdd.leftN}/${rdd.rightN}`,
-      ]],
-    });
-  }
-
-  if (propensityScore && methodAllowed(executableMethods, "propensity_score")) {
-    tables.push({
-      name: "propensity_score_balance",
-      description: `Propensity-score balance diagnostics for ${propensityScore.treatmentCol}`,
-      headers: ["Covariate", "Mean T", "Mean C", "Weighted T", "Weighted C", "SMD Before", "SMD After"],
-      rows: propensityScore.balance.map(item => ([
-        item.covariate.length > 18 ? `${item.covariate.slice(0, 15)}...` : item.covariate,
-        Math.round(item.meanTreated * 1000) / 1000,
-        Math.round(item.meanControl * 1000) / 1000,
-        Math.round(item.weightedTreated * 1000) / 1000,
-        Math.round(item.weightedControl * 1000) / 1000,
-        Math.round(item.smdBefore * 1000) / 1000,
-        Math.round(item.smdAfter * 1000) / 1000,
-      ])),
-    });
-  }
-
-  if (designHints) {
-    const causalOutputs = [
-      panelFixedEffects ? "panel_fixed_effects" : "",
-      diffInDiff ? "diff_in_diff/event_study" : "",
-      syntheticControl ? "synthetic_control" : "",
-      iv2Sls ? "iv_2sls" : "",
-      rdd ? "regression_discontinuity" : "",
-      propensityScore ? "propensity_score" : "",
-    ].filter(Boolean).join(", ") || "No credible causal estimator was feasible from detected columns";
-    tables.unshift({
-      name: "analysis_design_diagnostics",
-      description: "Design audit showing the chosen causal direction and whether causal estimators were feasible from the actual dataset columns.",
-      headers: ["Field", "Selected value", "Interpretation"],
-      rows: [
-        ["Outcome", designHints.primaryOutcomeCol || "Not detected", "Dependent variable; effects are reported as changes in this variable"],
-        ["Treatment / primary regressor", designHints.primaryTreatmentCol || designHints.primaryRegressorCol || "Not detected", "Candidate cause/exposure; never inferred from outcome-like variables"],
-        ["Entity ID", designHints.primaryEntityCol || "Not detected", "Required for panel FE, DiD, event study, or synthetic control"],
-        ["Time", designHints.primaryTimeCol || "Not detected", "Required for time-based causal designs"],
-        ["Controls", designHints.controlCols.length > 0 ? designHints.controlCols.join(", ") : "Auto-selected or none", "Included where model preparation permits"],
-        ["Feasible causal outputs", causalOutputs, "OLS is labelled associational unless one of these designs succeeds"],
-        ["Specified inputs matched", designHints.specifiedInputMatches.length > 0 ? designHints.specifiedInputMatches.join("; ") : "None", "User-provided inputs take priority over automatic inference"],
-        ["Specified inputs missing", designHints.specifiedInputMissing.length > 0 ? designHints.specifiedInputMissing.join("; ") : "None", "Missing user inputs are reported rather than silently replaced"],
-      ],
+      section: "diagnostic",
+      headers: ["Donor unit", "Weight"],
+      rows: syntheticControl.weights.filter(item => item.weight > 0.001).slice(0, 12).map(item => [displayName(item.unit, 36), tableNumber(item.weight)]),
+      notes: `Treated unit: ${syntheticControl.treatedUnit}; ${syntheticControl.donorCount} donor units. Pre-treatment RMSE = ${formatNumber(syntheticControl.preRmse)}, post-treatment RMSE = ${formatNumber(syntheticControl.postRmse)}, mean post-treatment gap = ${formatNumber(syntheticControl.attPostMean)}.`,
     });
   }
 
   if (quantileRegression && methodAllowed(executableMethods, "quantile_regression")) {
+    const qScale = coefficientDisplayScale(ds, quantileRegression.xCol, quantileRegression.estimates.map(e => e.slope));
     tables.push({
       name: "quantile_regression_results",
-      description: `Conditional quantile-regression profile for ${quantileRegression.yCol} on ${quantileRegression.xCol}${quantileRegression.controlCols.length > 0 ? ` with controls ${quantileRegression.controlCols.join(", ")}` : ""}`,
-      headers: ["Outcome", "Primary regressor", "Controls", "Tau", "Slope", "Bootstrap SE", "p-value", "95% CI", "Pseudo R1", "Bootstraps", "N", "Missing-data"],
+      description: `Quantile-regression coefficients on ${displayName(quantileRegression.xCol)} for ${displayName(quantileRegression.yCol)}`,
+      section: "main",
+      headers: ["Quantile", qScale > 1 ? `Coefficient (per ${formatCount(qScale)})` : "Coefficient", "Bootstrap SE", "95% CI", "p-value", "Pseudo R1"],
       rows: quantileRegression.estimates.map(estimate => ([
-        quantileRegression.yCol.length > 18 ? `${quantileRegression.yCol.slice(0, 15)}...` : quantileRegression.yCol,
-        quantileRegression.xCol.length > 18 ? `${quantileRegression.xCol.slice(0, 15)}...` : quantileRegression.xCol,
-        quantileRegression.controlCols.join(", ") || "none",
-        estimate.tau,
-        Math.round(estimate.slope * 1000) / 1000,
-        Math.round(estimate.slopeSe * 1000) / 1000,
-        estimate.pValue < 0.001 ? "<0.001" : estimate.pValue.toFixed(4),
-        `[${(Math.round(estimate.ciLower * 1000) / 1000).toFixed(3)}, ${(Math.round(estimate.ciUpper * 1000) / 1000).toFixed(3)}]`,
-        Math.round(estimate.pseudoR1 * 1000) / 1000,
-        estimate.bootstrapReplicates,
-        quantileRegression.n,
-        quantileRegression.missingDataMode,
+        estimate.tau.toFixed(2),
+        `${formatCoefficient(estimate.slope * qScale)}${significanceStars(estimate.pValue)}`,
+        formatCoefficient(estimate.slopeSe * qScale),
+        `[${formatCoefficient(estimate.ciLower * qScale)}, ${formatCoefficient(estimate.ciUpper * qScale)}]`,
+        formatPValue(estimate.pValue),
+        estimate.pseudoR1.toFixed(3),
+      ])),
+      notes: `Dependent variable: ${quantileRegression.yCol}; coefficient on ${quantileRegression.xCol}${quantileRegression.controlCols.length ? ` controlling for ${quantileRegression.controlCols.join(", ")}` : ""}. Bootstrap standard errors (${quantileRegression.estimates[0]?.bootstrapReplicates ?? 0} replications); n = ${formatCount(quantileRegression.n)}. * p < 0.05, ** p < 0.01, *** p < 0.001.`,
+    });
+  }
+
+  // ---------------------------------------------------------------- appendix tables
+  {
+    const rows: (string | number)[][] = [];
+    for (const col of ds.columns) {
+      let missing = 0;
+      let numericCount = 0;
+      let nonMissing = 0;
+      for (const row of ds.data) {
+        const value = row[col];
+        if (isMissingValue(value)) { missing++; continue; }
+        nonMissing++;
+        if (typeof value === "number" || (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value)))) numericCount++;
+      }
+      if (missing === 0) continue;
+      rows.push([
+        displayName(col, 36),
+        nonMissing > 0 && numericCount / nonMissing > 0.7 ? "Numeric" : "Categorical",
+        missing,
+        `${((missing / Math.max(1, ds.data.length)) * 100).toFixed(1)}%`,
+      ]);
+    }
+    rows.sort((a, b) => Number(b[2]) - Number(a[2]));
+    if (rows.length > 0) {
+      tables.push({
+        name: "missing_data_summary",
+        description: "Variables with missing values",
+        section: "appendix",
+        headers: ["Variable", "Type", "Missing N", "Missing %"],
+        rows: rows.slice(0, 30),
+        notes: `Based on ${formatCount(ds.data.length)} analysed rows; ${ds.columns.length - rows.length} of ${ds.columns.length} variables have no missing values.`,
+      });
+    }
+  }
+
+  const methodAssessments = bundle.methodAssessments || [];
+  if (methodAssessments.length > 0) {
+    tables.push({
+      name: "method_applicability_matrix",
+      description: "Data requirements and readiness of candidate statistical methods",
+      section: "appendix",
+      headers: ["Methodology", "Status", "Readiness (0-100)", "Evidence", "Interpretation"],
+      rows: methodAssessments.map(item => ([
+        item.label,
+        formatMethodApplicabilityStatus(item.status),
+        item.readinessScore,
+        item.evidence,
+        item.notes,
       ])),
     });
   }
@@ -7660,7 +7415,7 @@ export function generateDefaultMetrics(
 
   if (methodAllowed(executableMethods, "descriptive_statistics")) {
     for (const col of meaningfulNumericCols.slice(0, 5)) {
-      const values = ds.data.map(r => Number(r[col])).filter(v => !isNaN(v));
+      const values = numericValuesOf(ds, col);
       if (values.length === 0) continue;
       const mean = values.reduce((a, b) => a + b, 0) / values.length;
       const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / (values.length - 1 || 1);
